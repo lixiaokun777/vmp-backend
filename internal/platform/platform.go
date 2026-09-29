@@ -116,8 +116,8 @@ func (s *Service) CreateApplication(ctx context.Context, actor string, in Create
 	if err := tx.QueryRow(ctx, `SELECT cpu, memory_mb, disk_gb FROM flavors WHERE id=$1 AND enabled`, in.FlavorID).Scan(&cpu, &memoryMB, &diskGB); err != nil {
 		return nil, fmt.Errorf("invalid flavor: %w", err)
 	}
-	var imageName, imageFile, osFamily string
-	if err := tx.QueryRow(ctx, `SELECT name,file_name,os_family FROM images WHERE id=$1 AND enabled`, in.ImageID).Scan(&imageName, &imageFile, &osFamily); err != nil {
+	var imageName, imageFile, imagePath, osFamily string
+	if err := tx.QueryRow(ctx, `SELECT name,file_name,CASE WHEN source_type='local' THEN coalesce(source_location,file_name) ELSE file_name END,os_family FROM images WHERE id=$1 AND enabled AND sync_status='READY'`, in.ImageID).Scan(&imageName, &imageFile, &imagePath, &osFamily); err != nil {
 		return nil, fmt.Errorf("invalid image: %w", err)
 	}
 
@@ -195,7 +195,7 @@ func (s *Service) CreateApplication(ctx context.Context, actor string, in Create
 		return nil, fmt.Errorf("generate password hash: %w", err)
 	}
 	username := defaultUsername(osFamily)
-	payload, err := json.Marshal(map[string]any{"instance_id": instanceID, "name": in.InstanceName, "cpu": cpu, "memory_mb": memoryMB, "disk_gb": diskGB, "image_id": in.ImageID, "image_name": imageName, "image_file": imageFile, "network_id": in.NetworkID, "network_name": networkName, "bridge": bridge, "ip_address": ipAddress, "prefix_length": prefixLength, "gateway": gateway, "dns_servers": dnsServers, "username": username, "password_hash": passwordHash})
+	payload, err := json.Marshal(map[string]any{"instance_id": instanceID, "name": in.InstanceName, "cpu": cpu, "memory_mb": memoryMB, "disk_gb": diskGB, "image_id": in.ImageID, "image_name": imageName, "image_file": imageFile, "image_path": imagePath, "network_id": in.NetworkID, "network_name": networkName, "bridge": bridge, "ip_address": ipAddress, "prefix_length": prefixLength, "gateway": gateway, "dns_servers": dnsServers, "username": username, "password_hash": passwordHash})
 	if err != nil {
 		return nil, err
 	}
@@ -227,11 +227,12 @@ func (s *Service) RegisterHost(ctx context.Context, in HostRegistration) (map[st
 	}
 	var id, status string
 	err := s.DB.QueryRow(ctx, `
-		INSERT INTO hosts(name,provider_type,agent_mode,status,management_ip,allocatable_cpu,allocatable_memory_mb,allocatable_disk_gb,last_heartbeat_at)
-		VALUES ($1,'kvm',$2,$7,nullif($3,'')::inet,$4,$5,$6,now())
+		INSERT INTO hosts(name,provider_type,agent_mode,status,management_ip,allocatable_cpu,allocatable_memory_mb,allocatable_disk_gb,agent_allocatable_cpu,agent_allocatable_memory_mb,agent_allocatable_disk_gb,quota_cpu,quota_memory_mb,quota_disk_gb,last_heartbeat_at)
+		VALUES ($1,'kvm',$2,$7,nullif($3,'')::inet,$4,$5,$6,$4,$5,$6,$4,$5,$6,now())
 		ON CONFLICT(name) DO UPDATE SET agent_mode=excluded.agent_mode,status=CASE WHEN excluded.agent_mode='kvm-readonly' THEN 'CORDONED' WHEN hosts.status IN ('CORDONED','MAINTENANCE') THEN hosts.status ELSE 'ACTIVE' END,management_ip=excluded.management_ip,
-		allocatable_cpu=excluded.allocatable_cpu,allocatable_memory_mb=excluded.allocatable_memory_mb,
-		allocatable_disk_gb=excluded.allocatable_disk_gb,last_heartbeat_at=now(),updated_at=now()
+		agent_allocatable_cpu=excluded.agent_allocatable_cpu,agent_allocatable_memory_mb=excluded.agent_allocatable_memory_mb,agent_allocatable_disk_gb=excluded.agent_allocatable_disk_gb,
+		allocatable_cpu=least(excluded.agent_allocatable_cpu,coalesce(hosts.quota_cpu,excluded.agent_allocatable_cpu)),allocatable_memory_mb=least(excluded.agent_allocatable_memory_mb,coalesce(hosts.quota_memory_mb,excluded.agent_allocatable_memory_mb)),
+		allocatable_disk_gb=least(excluded.agent_allocatable_disk_gb,coalesce(hosts.quota_disk_gb,excluded.agent_allocatable_disk_gb)),last_heartbeat_at=now(),updated_at=now()
 		RETURNING id::text,status`, in.Name, in.Mode, in.ManagementIP, in.AllocatableCPU, in.AllocatableMemoryMB, in.AllocatableDiskGB, initialStatus).Scan(&id, &status)
 	return map[string]any{"id": id, "name": in.Name, "status": status}, err
 }
@@ -248,7 +249,7 @@ func (s *Service) Heartbeat(ctx context.Context, hostID string, hb Heartbeat) er
 	}
 	defer tx.Rollback(ctx)
 	inventoryAt := time.Now().UTC()
-	tag, err := tx.Exec(ctx, `UPDATE hosts SET status=CASE WHEN status IN ('CORDONED','MAINTENANCE') THEN status ELSE $1 END,allocatable_cpu=$2,allocatable_memory_mb=$3,allocatable_disk_gb=$4,facts=$5,last_heartbeat_at=now(),last_inventory_at=$6,updated_at=now() WHERE id=$7::uuid`, status, hb.AllocatableCPU, hb.AllocatableMemoryMB, hb.AllocatableDiskGB, facts, inventoryAt, hostID)
+	tag, err := tx.Exec(ctx, `UPDATE hosts SET status=CASE WHEN status IN ('CORDONED','MAINTENANCE') THEN status ELSE $1 END,agent_allocatable_cpu=$2,agent_allocatable_memory_mb=$3,agent_allocatable_disk_gb=$4,allocatable_cpu=least($2,coalesce(quota_cpu,$2)),allocatable_memory_mb=least($3,coalesce(quota_memory_mb,$3)),allocatable_disk_gb=least($4,coalesce(quota_disk_gb,$4)),facts=$5,last_heartbeat_at=now(),last_inventory_at=$6,updated_at=now() WHERE id=$7::uuid`, status, hb.AllocatableCPU, hb.AllocatableMemoryMB, hb.AllocatableDiskGB, facts, inventoryAt, hostID)
 	if err == nil && tag.RowsAffected() == 0 {
 		return pgx.ErrNoRows
 	}

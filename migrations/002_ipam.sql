@@ -23,16 +23,6 @@ CREATE TABLE IF NOT EXISTS ip_addresses (
 
 CREATE INDEX IF NOT EXISTS ip_addresses_allocate_idx ON ip_addresses(network_id, status, address);
 
-INSERT INTO networks(name,cidr,gateway,dns_servers,bridge)
-VALUES ('研发临时网络','10.200.9.0/24','10.200.9.1',ARRAY['10.200.1.10','10.200.1.11'],'br0')
-ON CONFLICT(name) DO NOTHING;
-
-INSERT INTO ip_addresses(network_id,address)
-SELECT n.id, ('10.200.9.' || gs)::inet
-FROM networks n CROSS JOIN generate_series(20,219) gs
-WHERE n.name='研发临时网络'
-ON CONFLICT(address) DO NOTHING;
-
 UPDATE ip_addresses ip
 SET status='ALLOCATED', instance_id=i.id, allocated_at=i.created_at, updated_at=now()
 FROM instances i

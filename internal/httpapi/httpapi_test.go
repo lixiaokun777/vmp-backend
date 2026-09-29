@@ -35,3 +35,20 @@ func TestImageFileNameValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateNetworkInput(t *testing.T) {
+	valid := networkInput{Name: "研发网络", CIDR: "10.200.8.0/22", Gateway: "10.200.11.254", DNSServers: []string{"10.200.1.10"}, Bridge: "br0"}
+	if err := validateNetworkInput(valid); err != nil {
+		t.Fatalf("valid network was rejected: %v", err)
+	}
+	invalidGateway := valid
+	invalidGateway.Gateway = "10.201.1.1"
+	if err := validateNetworkInput(invalidGateway); err == nil {
+		t.Fatal("gateway outside the network should be rejected")
+	}
+	invalidDNS := valid
+	invalidDNS.DNSServers = []string{"not-an-address"}
+	if err := validateNetworkInput(invalidDNS); err == nil {
+		t.Fatal("invalid DNS address should be rejected")
+	}
+}
