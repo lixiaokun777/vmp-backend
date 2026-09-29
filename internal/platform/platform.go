@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -195,7 +196,7 @@ func (s *Service) CreateApplication(ctx context.Context, actor string, in Create
 		return nil, fmt.Errorf("generate password hash: %w", err)
 	}
 	username := defaultUsername(osFamily)
-	payload, err := json.Marshal(map[string]any{"instance_id": instanceID, "name": in.InstanceName, "cpu": cpu, "memory_mb": memoryMB, "disk_gb": diskGB, "image_id": in.ImageID, "image_name": imageName, "image_file": imageFile, "image_path": imagePath, "network_id": in.NetworkID, "network_name": networkName, "bridge": bridge, "ip_address": ipAddress, "prefix_length": prefixLength, "gateway": gateway, "dns_servers": dnsServers, "username": username, "password_hash": passwordHash})
+	payload, err := json.Marshal(map[string]any{"instance_id": instanceID, "name": in.InstanceName, "cpu": cpu, "memory_mb": memoryMB, "disk_gb": diskGB, "image_id": in.ImageID, "image_name": imageName, "image_file": imageFile, "image_path": imagePath, "network_id": in.NetworkID, "network_name": networkName, "bridge": bridge, "mac_address": instanceMAC(instanceID), "ip_address": ipAddress, "prefix_length": prefixLength, "gateway": gateway, "dns_servers": dnsServers, "username": username, "password_hash": passwordHash})
 	if err != nil {
 		return nil, err
 	}
@@ -209,6 +210,12 @@ func (s *Service) CreateApplication(ctx context.Context, actor string, in Create
 		return nil, err
 	}
 	return map[string]any{"id": appID, "request_no": requestNo, "instance_id": instanceID, "host": hostName, "status": "APPROVED", "connection": map[string]any{"ip_address": ipAddress, "username": username, "password": password, "available_after_provisioning": true}}, nil
+}
+
+// instanceMAC 根据实例 UUID 生成稳定的 QEMU MAC，供域定义和 cloud-init 使用同一地址。
+func instanceMAC(instanceID string) string {
+	digest := sha256.Sum256([]byte(instanceID))
+	return fmt.Sprintf("52:54:00:%02x:%02x:%02x", digest[0], digest[1], digest[2])
 }
 
 func (s *Service) RegisterHost(ctx context.Context, in HostRegistration) (map[string]any, error) {
