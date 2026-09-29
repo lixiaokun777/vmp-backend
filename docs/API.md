@@ -4,15 +4,15 @@
 
 - `GET /api/v1/health`：健康检查。
 - `GET /api/v1/summary`：资源总览。
-- `GET /api/v1/hosts`、`PATCH /api/v1/hosts/{id}/status`：宿主机列表和状态管理。
+- `GET /api/v1/hosts`、`PATCH /api/v1/hosts/{id}/status`：宿主机列表和状态管理。默认只返回真实宿主机；`GET /api/v1/hosts?all=1` 可用于开发诊断并包含 mock 节点。
 - `PATCH /api/v1/hosts/{id}/quota`：在 Agent 安全上限内设置平台 CPU、内存和磁盘调度配额。
 - `GET/POST/PATCH /api/v1/flavors`：资源规格管理。
-- `GET/POST/PATCH /api/v1/images`：镜像元数据管理。本地镜像提供 `source_location`，Agent 强制其位于 `KVM_IMAGE_ROOT` 内；远程镜像提供 HTTP(S) URL 和 SHA-256，初始为 `PENDING`。
+- `GET/POST/PATCH /api/v1/images`：镜像元数据管理。`PATCH` 可编辑名称、系统版本和来源字段。本地镜像提供 `source_location`，Agent 强制其位于 `KVM_IMAGE_ROOT` 内；远程镜像提供 HTTP(S) URL 和 SHA-256，创建或修改来源后状态为 `PENDING`。
 - `GET/POST/PATCH /api/v1/networks`：管理员定义网段、网关、DNS 和 Bridge。
 - `POST /api/v1/networks/{id}/ip-ranges`：向指定网络添加 IP 范围。
 - `GET /api/v1/ip-addresses`：查询 IP 资源池。
 - `POST /api/v1/applications`：提交虚拟机申请；成功时在 `connection` 中返回 IP、用户名和仅显示一次的初始密码。
-- `GET /api/v1/instances`：实例列表；`scope=mine` 仅查询当前用户。
+- `GET /api/v1/instances`：实例列表；`scope=mine` 仅查询当前用户。默认排除 mock 节点的开发数据，诊断时可增加 `all=1`。
 - `GET /api/v1/instances/{id}`：实例配置、租期、任务历史和审计记录。
 - `POST /api/v1/instances/{id}/actions`：提交 `start`、`stop`、`reboot`、`retry` 或 `release` 操作。`retry` 仅用于重试已达失败上限的创建任务。
 - `POST /api/v1/instances/{id}/renew`：按小时续期，允许 1-720 小时。

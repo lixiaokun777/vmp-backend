@@ -74,12 +74,12 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) summary(w http.ResponseWriter, r *http.Request) {
 	row := a.Service.DB.QueryRow(r.Context(), `SELECT
-		(SELECT count(*) FROM hosts WHERE status='ACTIVE'),
-		(SELECT count(*) FROM instances WHERE lifecycle_status='RUNNING'),
-		(SELECT count(*) FROM instances WHERE lifecycle_status='PROVISIONING'),
-		(SELECT count(*) FROM applications),
-		coalesce((SELECT sum(reserved_memory_mb) FROM hosts),0),
-		coalesce((SELECT sum(allocatable_memory_mb) FROM hosts),0)`)
+		(SELECT count(*) FROM hosts WHERE status='ACTIVE' AND agent_mode<>'mock'),
+		(SELECT count(*) FROM instances i JOIN hosts h ON h.id=i.host_id WHERE i.lifecycle_status='RUNNING' AND h.agent_mode<>'mock'),
+		(SELECT count(*) FROM instances i JOIN hosts h ON h.id=i.host_id WHERE i.lifecycle_status='PROVISIONING' AND h.agent_mode<>'mock'),
+		(SELECT count(*) FROM applications a JOIN instances i ON i.application_id=a.id JOIN hosts h ON h.id=i.host_id WHERE h.agent_mode<>'mock'),
+		coalesce((SELECT sum(reserved_memory_mb) FROM hosts WHERE status='ACTIVE' AND agent_mode<>'mock'),0),
+		coalesce((SELECT sum(allocatable_memory_mb) FROM hosts WHERE status='ACTIVE' AND agent_mode<>'mock'),0)`)
 	var h, running, provisioning, apps, usedMem, totalMem int
 	if err := row.Scan(&h, &running, &provisioning, &apps, &usedMem, &totalMem); err != nil {
 		writeError(w, 500, err.Error())
@@ -89,7 +89,11 @@ func (a *API) summary(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) hosts(w http.ResponseWriter, r *http.Request) {
-	a.queryList(w, r, `SELECT jsonb_build_object('id',h.id,'name',h.name,'provider_type',h.provider_type,'agent_mode',h.agent_mode,'status',h.status,'management_ip',h.management_ip,'allocatable_cpu',h.allocatable_cpu,'allocatable_memory_mb',h.allocatable_memory_mb,'allocatable_disk_gb',h.allocatable_disk_gb,'agent_allocatable_cpu',h.agent_allocatable_cpu,'agent_allocatable_memory_mb',h.agent_allocatable_memory_mb,'agent_allocatable_disk_gb',h.agent_allocatable_disk_gb,'quota_cpu',h.quota_cpu,'quota_memory_mb',h.quota_memory_mb,'quota_disk_gb',h.quota_disk_gb,'reserved_cpu',h.reserved_cpu,'reserved_memory_mb',h.reserved_memory_mb,'reserved_disk_gb',h.reserved_disk_gb,'last_heartbeat_at',h.last_heartbeat_at,'last_inventory_at',h.last_inventory_at,'facts',h.facts,'discovered_instances',(SELECT count(*) FROM discovered_instances d WHERE d.host_id=h.id),'external_instances',(SELECT count(*) FROM discovered_instances d WHERE d.host_id=h.id AND d.ownership='EXTERNAL')) FROM hosts h ORDER BY h.name`)
+	filter := " WHERE h.agent_mode<>'mock'"
+	if r.URL.Query().Get("all") == "1" {
+		filter = ""
+	}
+	a.queryList(w, r, `SELECT jsonb_build_object('id',h.id,'name',h.name,'provider_type',h.provider_type,'agent_mode',h.agent_mode,'status',h.status,'management_ip',h.management_ip,'allocatable_cpu',h.allocatable_cpu,'allocatable_memory_mb',h.allocatable_memory_mb,'allocatable_disk_gb',h.allocatable_disk_gb,'agent_allocatable_cpu',h.agent_allocatable_cpu,'agent_allocatable_memory_mb',h.agent_allocatable_memory_mb,'agent_allocatable_disk_gb',h.agent_allocatable_disk_gb,'quota_cpu',h.quota_cpu,'quota_memory_mb',h.quota_memory_mb,'quota_disk_gb',h.quota_disk_gb,'reserved_cpu',h.reserved_cpu,'reserved_memory_mb',h.reserved_memory_mb,'reserved_disk_gb',h.reserved_disk_gb,'last_heartbeat_at',h.last_heartbeat_at,'last_inventory_at',h.last_inventory_at,'facts',h.facts,'discovered_instances',(SELECT count(*) FROM discovered_instances d WHERE d.host_id=h.id),'external_instances',(SELECT count(*) FROM discovered_instances d WHERE d.host_id=h.id AND d.ownership='EXTERNAL')) FROM hosts h`+filter+` ORDER BY h.name`)
 }
 func (a *API) flavors(w http.ResponseWriter, r *http.Request) {
 	filter := " WHERE enabled"
@@ -113,11 +117,17 @@ func (a *API) instances(w http.ResponseWriter, r *http.Request) {
 	if actor == "" {
 		actor = "developer"
 	}
-	where := ""
+	where := " WHERE h.agent_mode<>'mock'"
 	args := []any{}
 	if r.URL.Query().Get("scope") == "mine" {
-		where = " WHERE a.applicant=$1"
+		where += " AND a.applicant=$1"
 		args = append(args, actor)
+	}
+	if r.URL.Query().Get("all") == "1" {
+		where = ""
+		if r.URL.Query().Get("scope") == "mine" {
+			where = " WHERE a.applicant=$1"
+		}
 	}
 	a.queryListArgs(w, r, `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'host',h.name,'flavor',f.name,'image',im.name,'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'created_at',i.created_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id`+where+` ORDER BY i.created_at DESC`, args...)
 }
@@ -469,6 +479,42 @@ func (a *API) updateImage(w http.ResponseWriter, r *http.Request) {
 	var in imageInput
 	if json.NewDecoder(r.Body).Decode(&in) != nil || in.Enabled == nil {
 		writeError(w, 422, "enabled is required")
+		return
+	}
+	if in.Name != "" {
+		if in.OSFamily == "" || in.Version == "" || !imageFileNamePattern.MatchString(in.FileName) {
+			writeError(w, 422, "name, safe file_name, os_family and version are required")
+			return
+		}
+		syncStatus := "READY"
+		enabled := *in.Enabled
+		if in.SourceType == "local" {
+			if in.SourceLocation == "" {
+				in.SourceLocation = in.FileName
+			}
+			in.Checksum = ""
+		} else if in.SourceType == "remote" {
+			remoteURL, err := url.ParseRequestURI(in.SourceLocation)
+			if err != nil || (remoteURL.Scheme != "http" && remoteURL.Scheme != "https") || remoteURL.Host == "" || !regexp.MustCompile(`^[a-fA-F0-9]{64}$`).MatchString(in.Checksum) {
+				writeError(w, 422, "remote image requires an HTTP(S) URL and SHA-256 checksum")
+				return
+			}
+			syncStatus = "PENDING"
+			enabled = false
+		} else {
+			writeError(w, 422, "source_type must be local or remote")
+			return
+		}
+		tag, err := a.Service.DB.Exec(r.Context(), `UPDATE images SET name=$1,file_name=$2,source_type=$3,source_location=$4,checksum=nullif($5,''),sync_status=$6,os_family=$7,version=$8,enabled=$9 WHERE id=$10`, in.Name, in.FileName, in.SourceType, in.SourceLocation, in.Checksum, syncStatus, in.OSFamily, in.Version, enabled, r.PathValue("id"))
+		if err != nil {
+			writeError(w, 422, err.Error())
+			return
+		}
+		if tag.RowsAffected() == 0 {
+			writeError(w, 404, "image was not found")
+			return
+		}
+		writeJSON(w, 200, map[string]any{"enabled": enabled, "sync_status": syncStatus})
 		return
 	}
 	tag, err := a.Service.DB.Exec(r.Context(), `UPDATE images SET enabled=$1 WHERE id=$2 AND sync_status='READY'`, *in.Enabled, r.PathValue("id"))
