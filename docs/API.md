@@ -10,7 +10,7 @@
 - `GET /api/v1/networks`、`GET /api/v1/ip-addresses`：网络和 IP 资源池。
 - `POST /api/v1/applications`：提交虚拟机申请；成功时在 `connection` 中返回 IP、用户名和仅显示一次的初始密码。
 - `GET /api/v1/instances`：实例列表；`scope=mine` 仅查询当前用户。
-- `POST /api/v1/instances/{id}/actions`：提交 `start`、`stop`、`reboot` 或 `release` 操作。
+- `POST /api/v1/instances/{id}/actions`：提交 `start`、`stop`、`reboot`、`retry` 或 `release` 操作。`retry` 仅用于重试已达失败上限的创建任务。
 - `POST /api/v1/instances/{id}/renew`：按小时续期，允许 1-720 小时。
 
 ## Agent 接口

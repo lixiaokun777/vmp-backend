@@ -364,6 +364,27 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor, instanceID, 
 	if owner != actor {
 		return nil, errors.New("instance does not belong to the current user")
 	}
+	if action == "retry" {
+		if lifecycleStatus != "ERROR" {
+			return nil, fmt.Errorf("instance cannot retry from status %s", lifecycleStatus)
+		}
+		var failedTaskID string
+		err = tx.QueryRow(ctx, `SELECT id::text FROM tasks WHERE resource_id=$1::uuid AND task_type='CREATE_INSTANCE' AND status='FAILED' ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, instanceID).Scan(&failedTaskID)
+		if err != nil {
+			return nil, errors.New("failed create task was not found")
+		}
+		if _, err := tx.Exec(ctx, `UPDATE tasks SET status='PENDING',attempt=0,error_message=NULL,result=NULL,available_at=now(),claimed_at=NULL,completed_at=NULL,updated_at=now() WHERE id=$1::uuid`, failedTaskID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='PROVISIONING',updated_at=now() WHERE id=$1::uuid`, instanceID); err != nil {
+			return nil, err
+		}
+		_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.retry','instance',$2,'{}'::jsonb)`, actor, instanceID)
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return map[string]any{"id": instanceID, "status": "PROVISIONING", "task_type": "CREATE_INSTANCE"}, nil
+	}
 	if action == "release" {
 		switch lifecycleStatus {
 		case "RUNNING":
