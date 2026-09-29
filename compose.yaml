@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-vmlease}
+      POSTGRES_USER: ${POSTGRES_USER:-vmlease}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vmlease-dev}
+    volumes:
+      # 数据库数据持久化到独立数据卷。
+      - postgres-data:/var/lib/postgresql/data
+      # 仅用于开发环境首次初始化。
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  control-plane:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      LISTEN_ADDR: ${LISTEN_ADDR:-:8080}
+      DATABASE_URL: postgres://${POSTGRES_USER:-vmlease}:${POSTGRES_PASSWORD:-vmlease-dev}@postgres:5432/${POSTGRES_DB:-vmlease}?sslmode=disable
+      AGENT_BOOTSTRAP_TOKEN: ${AGENT_BOOTSTRAP_TOKEN:-dev-bootstrap-token}
+      AGENT_RUNTIME_TOKEN: ${AGENT_RUNTIME_TOKEN:-dev-agent-token}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:

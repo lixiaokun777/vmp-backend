@@ -1,0 +1,8 @@
+.env
+data/
+bin/
+dist/
+*.log
+.DS_Store
+.playwright-cli/
+output/
