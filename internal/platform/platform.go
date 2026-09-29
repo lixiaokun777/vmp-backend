@@ -2,10 +2,13 @@ package platform
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -113,8 +116,8 @@ func (s *Service) CreateApplication(ctx context.Context, actor string, in Create
 	if err := tx.QueryRow(ctx, `SELECT cpu, memory_mb, disk_gb FROM flavors WHERE id=$1 AND enabled`, in.FlavorID).Scan(&cpu, &memoryMB, &diskGB); err != nil {
 		return nil, fmt.Errorf("invalid flavor: %w", err)
 	}
-	var imageName string
-	if err := tx.QueryRow(ctx, `SELECT name FROM images WHERE id=$1 AND enabled`, in.ImageID).Scan(&imageName); err != nil {
+	var imageName, imageFile, osFamily string
+	if err := tx.QueryRow(ctx, `SELECT name,file_name,os_family FROM images WHERE id=$1 AND enabled`, in.ImageID).Scan(&imageName, &imageFile, &osFamily); err != nil {
 		return nil, fmt.Errorf("invalid image: %w", err)
 	}
 
@@ -151,7 +154,9 @@ func (s *Service) CreateApplication(ctx context.Context, actor string, in Create
 	if err != nil {
 		return nil, err
 	}
-	var ipAddress, networkName, bridge string
+	var ipAddress, networkName, bridge, gateway string
+	var prefixLength int
+	var dnsServers []string
 	if in.NetworkID == "" {
 		err = tx.QueryRow(ctx, `SELECT id::text FROM networks WHERE enabled ORDER BY created_at LIMIT 1`).Scan(&in.NetworkID)
 		if err != nil {
@@ -159,10 +164,10 @@ func (s *Service) CreateApplication(ctx context.Context, actor string, in Create
 		}
 	}
 	err = tx.QueryRow(ctx, `
-		SELECT ip.address::text,n.name,n.bridge
+		SELECT host(ip.address),n.name,n.bridge,masklen(n.cidr),host(n.gateway),n.dns_servers
 		FROM ip_addresses ip JOIN networks n ON n.id=ip.network_id
 		WHERE ip.network_id=$1::uuid AND n.enabled AND ip.status='FREE'
-		ORDER BY ip.address FOR UPDATE OF ip SKIP LOCKED LIMIT 1`, in.NetworkID).Scan(&ipAddress, &networkName, &bridge)
+		ORDER BY ip.address FOR UPDATE OF ip SKIP LOCKED LIMIT 1`, in.NetworkID).Scan(&ipAddress, &networkName, &bridge, &prefixLength, &gateway, &dnsServers)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.New("selected network has no free IP address")
@@ -181,16 +186,29 @@ func (s *Service) CreateApplication(ctx context.Context, actor string, in Create
 	if err != nil {
 		return nil, err
 	}
-	payload, _ := json.Marshal(map[string]any{"instance_id": instanceID, "name": in.InstanceName, "cpu": cpu, "memory_mb": memoryMB, "disk_gb": diskGB, "image_id": in.ImageID, "image_name": imageName, "network_id": in.NetworkID, "network_name": networkName, "bridge": bridge, "ip_address": ipAddress})
+	password, err := generatePassword(20)
+	if err != nil {
+		return nil, err
+	}
+	var passwordHash string
+	if err := tx.QueryRow(ctx, `SELECT crypt($1, gen_salt('bf', 12))`, password).Scan(&passwordHash); err != nil {
+		return nil, fmt.Errorf("generate password hash: %w", err)
+	}
+	username := defaultUsername(osFamily)
+	payload, err := json.Marshal(map[string]any{"instance_id": instanceID, "name": in.InstanceName, "cpu": cpu, "memory_mb": memoryMB, "disk_gb": diskGB, "image_id": in.ImageID, "image_name": imageName, "image_file": imageFile, "network_id": in.NetworkID, "network_name": networkName, "bridge": bridge, "ip_address": ipAddress, "prefix_length": prefixLength, "gateway": gateway, "dns_servers": dnsServers, "username": username, "password_hash": passwordHash})
+	if err != nil {
+		return nil, err
+	}
 	_, err = tx.Exec(ctx, `INSERT INTO tasks(idempotency_key,task_type,resource_id,host_id,payload) VALUES ($1,'CREATE_INSTANCE',$2::uuid,$3::uuid,$4)`, "create:"+instanceID, instanceID, hostID, payload)
 	if err != nil {
 		return nil, err
 	}
-	_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES ($1,'application.create','application',$2,$3)`, actor, appID, payload)
+	auditDetail, _ := json.Marshal(map[string]any{"instance_id": instanceID, "host_id": hostID, "image_id": in.ImageID, "network_id": in.NetworkID, "ip_address": ipAddress})
+	_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES ($1,'application.create','application',$2,$3)`, actor, appID, auditDetail)
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return map[string]any{"id": appID, "request_no": requestNo, "instance_id": instanceID, "host": hostName, "status": "APPROVED"}, nil
+	return map[string]any{"id": appID, "request_no": requestNo, "instance_id": instanceID, "host": hostName, "status": "APPROVED", "connection": map[string]any{"ip_address": ipAddress, "username": username, "password": password, "available_after_provisioning": true}}, nil
 }
 
 func (s *Service) RegisterHost(ctx context.Context, in HostRegistration) (map[string]any, error) {
@@ -200,19 +218,22 @@ func (s *Service) RegisterHost(ctx context.Context, in HostRegistration) (map[st
 	if in.Mode == "" {
 		in.Mode = "mock"
 	}
+	if in.Mode != "mock" && in.Mode != "kvm-readonly" && in.Mode != "kvm" {
+		return nil, errors.New("unsupported agent mode")
+	}
 	initialStatus := "ACTIVE"
-	if in.Mode == "kvm-readonly" {
+	if strings.HasPrefix(in.Mode, "kvm") {
 		initialStatus = "CORDONED"
 	}
-	var id string
+	var id, status string
 	err := s.DB.QueryRow(ctx, `
 		INSERT INTO hosts(name,provider_type,agent_mode,status,management_ip,allocatable_cpu,allocatable_memory_mb,allocatable_disk_gb,last_heartbeat_at)
 		VALUES ($1,'kvm',$2,$7,nullif($3,'')::inet,$4,$5,$6,now())
 		ON CONFLICT(name) DO UPDATE SET agent_mode=excluded.agent_mode,status=CASE WHEN excluded.agent_mode='kvm-readonly' THEN 'CORDONED' WHEN hosts.status IN ('CORDONED','MAINTENANCE') THEN hosts.status ELSE 'ACTIVE' END,management_ip=excluded.management_ip,
 		allocatable_cpu=excluded.allocatable_cpu,allocatable_memory_mb=excluded.allocatable_memory_mb,
 		allocatable_disk_gb=excluded.allocatable_disk_gb,last_heartbeat_at=now(),updated_at=now()
-		RETURNING id::text`, in.Name, in.Mode, in.ManagementIP, in.AllocatableCPU, in.AllocatableMemoryMB, in.AllocatableDiskGB, initialStatus).Scan(&id)
-	return map[string]any{"id": id, "name": in.Name, "status": initialStatus}, err
+		RETURNING id::text,status`, in.Name, in.Mode, in.ManagementIP, in.AllocatableCPU, in.AllocatableMemoryMB, in.AllocatableDiskGB, initialStatus).Scan(&id, &status)
+	return map[string]any{"id": id, "name": in.Name, "status": status}, err
 }
 
 func (s *Service) Heartbeat(ctx context.Context, hostID string, hb Heartbeat) error {
@@ -262,6 +283,57 @@ func (s *Service) Heartbeat(ctx context.Context, hostID string, hb Heartbeat) er
 }
 
 var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
+
+func generatePassword(length int) (string, error) {
+	if length < 12 {
+		return "", errors.New("password length must be at least 12")
+	}
+	groups := []string{"ABCDEFGHJKLMNPQRSTUVWXYZ", "abcdefghijkmnopqrstuvwxyz", "23456789"}
+	all := strings.Join(groups, "")
+	result := make([]byte, length)
+	for index, group := range groups {
+		value, err := randomCharacter(group)
+		if err != nil {
+			return "", err
+		}
+		result[index] = value
+	}
+	for index := len(groups); index < length; index++ {
+		value, err := randomCharacter(all)
+		if err != nil {
+			return "", err
+		}
+		result[index] = value
+	}
+	for index := len(result) - 1; index > 0; index-- {
+		position, err := rand.Int(rand.Reader, big.NewInt(int64(index+1)))
+		if err != nil {
+			return "", err
+		}
+		other := int(position.Int64())
+		result[index], result[other] = result[other], result[index]
+	}
+	return string(result), nil
+}
+
+func randomCharacter(alphabet string) (byte, error) {
+	position, err := rand.Int(rand.Reader, big.NewInt(int64(len(alphabet))))
+	if err != nil {
+		return 0, err
+	}
+	return alphabet[position.Int64()], nil
+}
+
+func defaultUsername(osFamily string) string {
+	switch strings.ToLower(osFamily) {
+	case "ubuntu", "debian":
+		return "ubuntu"
+	case "centos", "rocky", "almalinux", "rhel":
+		return "cloud-user"
+	default:
+		return "cloud-user"
+	}
+}
 
 func (s *Service) PollTask(ctx context.Context, hostID string) (map[string]any, error) {
 	tx, err := s.DB.Begin(ctx)

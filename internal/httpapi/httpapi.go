@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -92,7 +93,7 @@ func (a *API) images(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("all") == "1" {
 		filter = ""
 	}
-	a.queryList(w, r, `SELECT jsonb_build_object('id',id,'name',name,'os_family',os_family,'version',version,'enabled',enabled) FROM images`+filter+` ORDER BY name`)
+	a.queryList(w, r, `SELECT jsonb_build_object('id',id,'name',name,'file_name',file_name,'os_family',os_family,'version',version,'enabled',enabled) FROM images`+filter+` ORDER BY name`)
 }
 func (a *API) applications(w http.ResponseWriter, r *http.Request) {
 	a.queryList(w, r, `SELECT jsonb_build_object('id',a.id,'request_no',a.request_no,'applicant',a.applicant,'instance_name',a.instance_name,'purpose',a.purpose,'flavor',f.name,'image',i.name,'lease_hours',a.lease_hours,'status',a.status,'created_at',a.created_at) FROM applications a JOIN flavors f ON f.id=a.flavor_id JOIN images i ON i.id=a.image_id ORDER BY a.created_at DESC`)
@@ -213,18 +214,21 @@ func (a *API) updateFlavor(w http.ResponseWriter, r *http.Request) {
 type imageInput struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
+	FileName string `json:"file_name"`
 	OSFamily string `json:"os_family"`
 	Version  string `json:"version"`
 	Enabled  *bool  `json:"enabled"`
 }
 
+var imageFileNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
+
 func (a *API) createImage(w http.ResponseWriter, r *http.Request) {
 	var in imageInput
-	if json.NewDecoder(r.Body).Decode(&in) != nil || in.ID == "" || in.Name == "" || in.OSFamily == "" || in.Version == "" {
+	if json.NewDecoder(r.Body).Decode(&in) != nil || in.ID == "" || in.Name == "" || !imageFileNamePattern.MatchString(in.FileName) || in.OSFamily == "" || in.Version == "" {
 		writeError(w, 422, "invalid image")
 		return
 	}
-	_, err := a.Service.DB.Exec(r.Context(), `INSERT INTO images(id,name,os_family,version) VALUES($1,$2,$3,$4)`, in.ID, in.Name, in.OSFamily, in.Version)
+	_, err := a.Service.DB.Exec(r.Context(), `INSERT INTO images(id,name,file_name,os_family,version) VALUES($1,$2,$3,$4,$5)`, in.ID, in.Name, in.FileName, in.OSFamily, in.Version)
 	if err != nil {
 		writeError(w, 409, err.Error())
 		return
