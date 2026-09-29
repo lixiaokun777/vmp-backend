@@ -522,7 +522,7 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 	}
 	data, _ := json.Marshal(result)
 	if result.Success {
-		_, err = tx.Exec(ctx, `UPDATE tasks SET status='SUCCEEDED',result=$1,completed_at=now(),updated_at=now() WHERE id=$2::uuid`, data, taskID)
+		_, err = tx.Exec(ctx, `UPDATE tasks SET status='SUCCEEDED',result=$1,error_message=NULL,completed_at=now(),updated_at=now() WHERE id=$2::uuid`, data, taskID)
 		if err == nil {
 			err = s.applySuccessfulTask(ctx, tx, taskType, resourceID, result)
 		}
