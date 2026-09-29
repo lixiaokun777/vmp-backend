@@ -586,12 +586,9 @@ func (s *Service) applySuccessfulTask(ctx context.Context, tx pgx.Tx, taskType, 
 		_, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status=CASE WHEN retention_until IS NOT NULL AND expires_at<=now() THEN 'RETAINED' ELSE 'STOPPED' END,provider_status='STOPPED',updated_at=now() WHERE id=$1::uuid`, resourceID)
 		return err
 	case "DELETE_INSTANCE":
-		var hostID string
+		var hostID, applicationID string
 		var cpu, memoryMB, diskGB int
-		if err := tx.QueryRow(ctx, `SELECT i.host_id::text,f.cpu,f.memory_mb,f.disk_gb FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id WHERE i.id=$1::uuid FOR UPDATE OF i`, resourceID).Scan(&hostID, &cpu, &memoryMB, &diskGB); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='RELEASED',provider_status='DELETED',provider_ref=NULL,ip_address=NULL,updated_at=now() WHERE id=$1::uuid`, resourceID); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT i.host_id::text,i.application_id::text,f.cpu,f.memory_mb,f.disk_gb FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id WHERE i.id=$1::uuid FOR UPDATE OF i`, resourceID).Scan(&hostID, &applicationID, &cpu, &memoryMB, &diskGB); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE ip_addresses SET status='FREE',instance_id=NULL,reserved_at=NULL,allocated_at=NULL,updated_at=now() WHERE instance_id=$1::uuid`, resourceID); err != nil {
@@ -600,7 +597,20 @@ func (s *Service) applySuccessfulTask(ctx context.Context, tx pgx.Tx, taskType, 
 		if _, err := tx.Exec(ctx, `UPDATE hosts SET reserved_cpu=greatest(0,reserved_cpu-$1),reserved_memory_mb=greatest(0,reserved_memory_mb-$2),reserved_disk_gb=greatest(0,reserved_disk_gb-$3),updated_at=now() WHERE id=$4::uuid`, cpu, memoryMB, diskGB, hostID); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `UPDATE applications SET status='RELEASED' WHERE id=(SELECT application_id FROM instances WHERE id=$1::uuid)`, resourceID)
+		// 宿主机确认删除成功后，同时清除控制面的实例展示、任务和审计记录。
+		if _, err := tx.Exec(ctx, `DELETE FROM discovered_instances WHERE platform_instance_id=$1::uuid`, resourceID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM audit_logs WHERE (resource_type='instance' AND resource_id=$1) OR (resource_type='application' AND resource_id=$2)`, resourceID, applicationID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM tasks WHERE resource_id=$1::uuid`, resourceID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM instances WHERE id=$1::uuid`, resourceID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM applications WHERE id=$1::uuid`, applicationID)
 		return err
 	default:
 		return fmt.Errorf("unsupported successful task type %s", taskType)

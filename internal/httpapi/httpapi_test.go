@@ -37,7 +37,7 @@ func TestImageFileNameValidation(t *testing.T) {
 }
 
 func TestValidateNetworkInput(t *testing.T) {
-	valid := networkInput{Name: "研发网络", CIDR: "10.200.8.0/22", Gateway: "10.200.11.254", DNSServers: []string{"10.200.1.10"}, Bridge: "br0"}
+	valid := networkInput{Name: "研发网络", CIDR: "10.200.8.0/22", Gateway: "10.200.11.254", DNSServers: []string{"10.200.1.10"}, Bridge: "br0", RangeStart: "10.200.9.130", RangeEnd: "10.200.9.150"}
 	if err := validateNetworkInput(valid); err != nil {
 		t.Fatalf("valid network was rejected: %v", err)
 	}
@@ -50,5 +50,21 @@ func TestValidateNetworkInput(t *testing.T) {
 	invalidDNS.DNSServers = []string{"not-an-address"}
 	if err := validateNetworkInput(invalidDNS); err == nil {
 		t.Fatal("invalid DNS address should be rejected")
+	}
+	invalidRange := valid
+	invalidRange.RangeEnd = "10.201.1.10"
+	if err := validateNetworkInput(invalidRange); err == nil {
+		t.Fatal("IP range outside the network should be rejected")
+	}
+}
+
+func TestNetworkRangeAddressesExcludesGateway(t *testing.T) {
+	in := networkInput{CIDR: "10.200.8.0/22", Gateway: "10.200.9.131", RangeStart: "10.200.9.130", RangeEnd: "10.200.9.132"}
+	addresses, err := networkRangeAddresses(in)
+	if err != nil {
+		t.Fatalf("valid IP range was rejected: %v", err)
+	}
+	if len(addresses) != 2 || addresses[0] != "10.200.9.130" || addresses[1] != "10.200.9.132" {
+		t.Fatalf("gateway should be excluded, got %#v", addresses)
 	}
 }

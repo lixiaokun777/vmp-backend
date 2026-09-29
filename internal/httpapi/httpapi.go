@@ -122,18 +122,16 @@ func (a *API) instances(w http.ResponseWriter, r *http.Request) {
 	if actor == "" {
 		actor = "developer"
 	}
-	where := " WHERE h.agent_mode<>'mock'"
+	filters := []string{"i.lifecycle_status<>'RELEASED'"}
 	args := []any{}
+	if r.URL.Query().Get("all") != "1" {
+		filters = append(filters, "h.agent_mode<>'mock'")
+	}
 	if r.URL.Query().Get("scope") == "mine" {
-		where += " AND a.applicant=$1"
+		filters = append(filters, "a.applicant=$1")
 		args = append(args, actor)
 	}
-	if r.URL.Query().Get("all") == "1" {
-		where = ""
-		if r.URL.Query().Get("scope") == "mine" {
-			where = " WHERE a.applicant=$1"
-		}
-	}
+	where := " WHERE " + strings.Join(filters, " AND ")
 	a.queryListArgs(w, r, `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'host',h.name,'flavor',f.name,'image',im.name,'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'created_at',i.created_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id`+where+` ORDER BY i.created_at DESC`, args...)
 }
 
@@ -209,7 +207,7 @@ func (a *API) queryListArgs(w http.ResponseWriter, r *http.Request, sql string, 
 }
 
 func (a *API) networks(w http.ResponseWriter, r *http.Request) {
-	a.queryList(w, r, `SELECT jsonb_build_object('id',n.id,'name',n.name,'cidr',n.cidr,'gateway',n.gateway,'dns_servers',n.dns_servers,'bridge',n.bridge,'enabled',n.enabled,'total',count(ip.id),'free',count(ip.id) FILTER(WHERE ip.status='FREE'),'reserved',count(ip.id) FILTER(WHERE ip.status='RESERVED'),'allocated',count(ip.id) FILTER(WHERE ip.status='ALLOCATED'),'quarantined',count(ip.id) FILTER(WHERE ip.status='QUARANTINED')) FROM networks n LEFT JOIN ip_addresses ip ON ip.network_id=n.id GROUP BY n.id ORDER BY n.name`)
+	a.queryList(w, r, `SELECT jsonb_build_object('id',n.id,'name',n.name,'cidr',n.cidr,'gateway',n.gateway,'dns_servers',n.dns_servers,'bridge',n.bridge,'enabled',n.enabled,'ip_range_start',(array_agg(host(ip.address) ORDER BY ip.address) FILTER(WHERE ip.id IS NOT NULL))[1],'ip_range_end',(array_agg(host(ip.address) ORDER BY ip.address DESC) FILTER(WHERE ip.id IS NOT NULL))[1],'total',count(ip.id),'free',count(ip.id) FILTER(WHERE ip.status='FREE'),'reserved',count(ip.id) FILTER(WHERE ip.status='RESERVED'),'allocated',count(ip.id) FILTER(WHERE ip.status='ALLOCATED'),'quarantined',count(ip.id) FILTER(WHERE ip.status='QUARANTINED')) FROM networks n LEFT JOIN ip_addresses ip ON ip.network_id=n.id GROUP BY n.id ORDER BY n.name`)
 }
 
 type networkInput struct {
@@ -219,6 +217,8 @@ type networkInput struct {
 	DNSServers []string `json:"dns_servers"`
 	Bridge     string   `json:"bridge"`
 	Enabled    *bool    `json:"enabled"`
+	RangeStart string   `json:"ip_range_start"`
+	RangeEnd   string   `json:"ip_range_end"`
 }
 
 func validateNetworkInput(in networkInput) error {
@@ -236,7 +236,40 @@ func validateNetworkInput(in networkInput) error {
 			return errors.New("DNS server must be an IPv4 address")
 		}
 	}
+	if _, err := networkRangeAddresses(in); err != nil {
+		return err
+	}
 	return nil
+}
+
+// networkRangeAddresses 将管理员配置的唯一地址范围展开为可分配地址，并排除网关。
+func networkRangeAddresses(in networkInput) ([]string, error) {
+	start, startErr := netip.ParseAddr(in.RangeStart)
+	end, endErr := netip.ParseAddr(in.RangeEnd)
+	if startErr != nil || endErr != nil || !start.Is4() || !end.Is4() || start.Compare(end) > 0 {
+		return nil, errors.New("IP 地址范围无效")
+	}
+	prefix, _ := netip.ParsePrefix(in.CIDR)
+	gateway, _ := netip.ParseAddr(in.Gateway)
+	addresses := make([]string, 0)
+	for current := start; ; current = current.Next() {
+		if !prefix.Contains(current) {
+			return nil, errors.New("IP 地址范围必须完全位于网络 CIDR 内")
+		}
+		if current != gateway {
+			addresses = append(addresses, current.String())
+		}
+		if current == end {
+			break
+		}
+		if len(addresses) >= 4096 {
+			return nil, errors.New("IP 地址范围不能超过 4096 个地址")
+		}
+	}
+	if len(addresses) == 0 {
+		return nil, errors.New("IP 地址范围中没有可分配地址")
+	}
+	return addresses, nil
 }
 
 func (a *API) createNetwork(w http.ResponseWriter, r *http.Request) {
@@ -249,13 +282,28 @@ func (a *API) createNetwork(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 422, err.Error())
 		return
 	}
+	addresses, _ := networkRangeAddresses(in)
+	tx, err := a.Service.DB.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
 	var id string
-	err := a.Service.DB.QueryRow(r.Context(), `INSERT INTO networks(name,cidr,gateway,dns_servers,bridge,enabled) VALUES($1,$2::cidr,$3::inet,$4,$5,coalesce($6,true)) RETURNING id::text`, in.Name, in.CIDR, in.Gateway, in.DNSServers, in.Bridge, in.Enabled).Scan(&id)
+	err = tx.QueryRow(r.Context(), `INSERT INTO networks(name,cidr,gateway,dns_servers,bridge,enabled) VALUES($1,$2::cidr,$3::inet,$4,$5,coalesce($6,true)) RETURNING id::text`, in.Name, in.CIDR, in.Gateway, in.DNSServers, in.Bridge, in.Enabled).Scan(&id)
 	if err != nil {
 		writeError(w, 409, err.Error())
 		return
 	}
-	writeJSON(w, 201, map[string]any{"id": id})
+	if _, err := tx.Exec(r.Context(), `INSERT INTO ip_addresses(network_id,address) SELECT $1::uuid,value::inet FROM unnest($2::text[]) value`, id, addresses); err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 201, map[string]any{"id": id, "ip_range_start": in.RangeStart, "ip_range_end": in.RangeEnd, "total": len(addresses)})
 }
 
 func (a *API) updateNetwork(w http.ResponseWriter, r *http.Request) {
@@ -268,7 +316,57 @@ func (a *API) updateNetwork(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 422, err.Error())
 		return
 	}
-	tag, err := a.Service.DB.Exec(r.Context(), `UPDATE networks SET name=$1,cidr=$2::cidr,gateway=$3::inet,dns_servers=$4,bridge=$5,enabled=$6,updated_at=now() WHERE id=$7::uuid`, in.Name, in.CIDR, in.Gateway, in.DNSServers, in.Bridge, *in.Enabled, r.PathValue("id"))
+	addresses, _ := networkRangeAddresses(in)
+	tx, err := a.Service.DB.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+	var existingID string
+	if err := tx.QueryRow(r.Context(), `SELECT id::text FROM networks WHERE id=$1::uuid FOR UPDATE`, r.PathValue("id")).Scan(&existingID); err != nil {
+		writeError(w, 404, "网络不存在")
+		return
+	}
+	rows, err := tx.Query(r.Context(), `SELECT id FROM ip_addresses WHERE network_id=$1::uuid FOR UPDATE`, existingID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	for rows.Next() {
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	var occupiedOutside int
+	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM ip_addresses WHERE network_id=$1::uuid AND status<>'FREE' AND (NOT (address BETWEEN $2::inet AND $3::inet) OR address=$4::inet)`, existingID, in.RangeStart, in.RangeEnd, in.Gateway).Scan(&occupiedOutside); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if occupiedOutside > 0 {
+		writeError(w, 409, "新范围之外仍有已分配、预留或隔离的 IP，不能替换地址池")
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `DELETE FROM ip_addresses WHERE network_id=$1::uuid AND status='FREE' AND (NOT (address BETWEEN $2::inet AND $3::inet) OR address=$4::inet)`, existingID, in.RangeStart, in.RangeEnd, in.Gateway); err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `INSERT INTO ip_addresses(network_id,address) SELECT $1::uuid,value::inet FROM unnest($2::text[]) value ON CONFLICT(address) DO NOTHING`, existingID, addresses); err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
+	var actualRangeSize int
+	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM ip_addresses WHERE network_id=$1::uuid AND address BETWEEN $2::inet AND $3::inet`, existingID, in.RangeStart, in.RangeEnd).Scan(&actualRangeSize); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if actualRangeSize != len(addresses) {
+		writeError(w, 409, "IP 范围与其他网络的地址池冲突")
+		return
+	}
+	tag, err := tx.Exec(r.Context(), `UPDATE networks SET name=$1,cidr=$2::cidr,gateway=$3::inet,dns_servers=$4,bridge=$5,enabled=$6,updated_at=now() WHERE id=$7::uuid`, in.Name, in.CIDR, in.Gateway, in.DNSServers, in.Bridge, *in.Enabled, existingID)
 	if err != nil {
 		writeError(w, 422, err.Error())
 		return
@@ -277,7 +375,11 @@ func (a *API) updateNetwork(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "network not found")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"id": r.PathValue("id"), "updated": true})
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": existingID, "updated": true, "ip_range_start": in.RangeStart, "ip_range_end": in.RangeEnd, "total": len(addresses)})
 }
 
 func (a *API) deleteNetwork(w http.ResponseWriter, r *http.Request) {

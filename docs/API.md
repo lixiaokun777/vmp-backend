@@ -9,14 +9,13 @@
 - `DELETE /api/v1/hosts/{id}`：删除已离线且没有未释放实例和执行中任务的宿主机纳管记录，不操作外部虚机。
 - `GET/POST/PATCH/DELETE /api/v1/flavors`：资源规格管理。已被申请记录引用的规格只能停用。
 - `GET/POST/PATCH/DELETE /api/v1/images`：镜像元数据管理。删除只移除平台元数据，不删除宿主机镜像文件；已被引用的镜像只能停用。`PATCH` 可编辑名称、系统版本和来源字段。本地镜像提供 `source_location`，Agent 强制其位于 `KVM_IMAGE_ROOT` 内；远程镜像提供 HTTP(S) URL 和 SHA-256，创建或修改来源后状态为 `PENDING`。
-- `GET/POST/PATCH/DELETE /api/v1/networks`：管理员定义网段、网关、DNS 和 Bridge。仍有非空闲 IP 的网络不能删除。
-- `POST /api/v1/networks/{id}/ip-ranges`：向指定网络添加 IP 范围。
-- `DELETE /api/v1/networks/{id}/ip-ranges`：删除指定起止地址范围，范围内所有地址必须为空闲。
+- `GET/POST/PATCH/DELETE /api/v1/networks`：管理员同时定义网段、网关、DNS、Bridge 和唯一有效的 `ip_range_start` / `ip_range_end`。修改范围会事务性替换旧的空闲地址池；新范围之外存在已分配、预留或隔离地址时拒绝修改。仍有非空闲 IP 的网络不能删除。
+- `POST/DELETE /api/v1/networks/{id}/ip-ranges`：兼容旧客户端的地址池增删接口；Web 管理端统一通过网络编辑接口维护唯一范围。
 - `GET /api/v1/ip-addresses`：查询 IP 资源池。
 - `POST /api/v1/applications`：提交虚拟机申请；成功时在 `connection` 中返回 IP、用户名和仅显示一次的初始密码。
-- `GET /api/v1/instances`：实例列表；`scope=mine` 仅查询当前用户。默认排除 mock 节点的开发数据，诊断时可增加 `all=1`。
+- `GET /api/v1/instances`：活动实例列表；已完成删除的实例不会返回。`scope=mine` 仅查询当前用户。默认排除 mock 节点的开发数据，诊断时可增加 `all=1`。
 - `GET /api/v1/instances/{id}`：实例配置、租期、任务历史和审计记录。
-- `POST /api/v1/instances/{id}/actions`：提交 `start`、`stop`、`reboot`、`retry`、`release` 或 `force_delete` 操作。普通释放保留磁盘和原 IP 7 天；`force_delete` 跳过保留期，删除任务成功后释放 IP 和宿主机配额。`retry` 仅用于重试已达失败上限的创建任务。
+- `POST /api/v1/instances/{id}/actions`：提交 `start`、`stop`、`reboot`、`retry`、`release` 或 `force_delete` 操作。普通释放保留磁盘和原 IP 7 天；`force_delete` 跳过保留期。删除任务成功后释放 IP 和宿主机配额，并清除实例、申请、任务与对应审计展示记录。`retry` 仅用于重试已达失败上限的创建任务。
 - `POST /api/v1/instances/{id}/renew`：按小时续期，允许 1-720 小时。
 
 ## Agent 接口
