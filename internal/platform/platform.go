@@ -335,6 +335,133 @@ func defaultUsername(osFamily string) string {
 	}
 }
 
+var instanceActionTasks = map[string]struct {
+	TaskType     string
+	RequiredFrom string
+	PendingState string
+}{
+	"start":  {TaskType: "START_INSTANCE", RequiredFrom: "STOPPED", PendingState: "STARTING"},
+	"stop":   {TaskType: "STOP_INSTANCE", RequiredFrom: "RUNNING", PendingState: "STOPPING"},
+	"reboot": {TaskType: "REBOOT_INSTANCE", RequiredFrom: "RUNNING", PendingState: "REBOOTING"},
+}
+
+func (s *Service) PerformInstanceAction(ctx context.Context, actor, instanceID, action string) (map[string]any, error) {
+	if !uuidPattern.MatchString(instanceID) {
+		return nil, errors.New("invalid instance id")
+	}
+	action = strings.ToLower(strings.TrimSpace(action))
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	var owner, hostID, name, lifecycleStatus string
+	var expiresAt time.Time
+	err = tx.QueryRow(ctx, `SELECT a.applicant,i.host_id::text,i.name,i.lifecycle_status,i.expires_at FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &hostID, &name, &lifecycleStatus, &expiresAt)
+	if err != nil {
+		return nil, err
+	}
+	if owner != actor {
+		return nil, errors.New("instance does not belong to the current user")
+	}
+	if action == "release" {
+		switch lifecycleStatus {
+		case "RUNNING":
+			if err := insertInstanceTask(ctx, tx, "STOP_INSTANCE", instanceID, hostID, name, "manual-release"); err != nil {
+				return nil, err
+			}
+			lifecycleStatus = "STOPPING"
+		case "STOPPED":
+			lifecycleStatus = "RETAINED"
+		case "RETAINED":
+			return map[string]any{"id": instanceID, "status": lifecycleStatus}, tx.Commit(ctx)
+		default:
+			return nil, fmt.Errorf("instance cannot be released from status %s", lifecycleStatus)
+		}
+		_, err = tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,expires_at=least(expires_at,now()),retention_until=now()+interval '7 days',updated_at=now() WHERE id=$2::uuid`, lifecycleStatus, instanceID)
+		if err != nil {
+			return nil, err
+		}
+		_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.release','instance',$2,$3)`, actor, instanceID, []byte(`{"retention_days":7}`))
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return map[string]any{"id": instanceID, "status": lifecycleStatus, "retention_days": 7}, nil
+	}
+	spec, ok := instanceActionTasks[action]
+	if !ok {
+		return nil, errors.New("unsupported instance action")
+	}
+	if lifecycleStatus != spec.RequiredFrom {
+		return nil, fmt.Errorf("instance cannot %s from status %s", action, lifecycleStatus)
+	}
+	if action == "start" && !expiresAt.After(time.Now()) {
+		return nil, errors.New("expired instance must be renewed before it can be started")
+	}
+	if err := insertInstanceTask(ctx, tx, spec.TaskType, instanceID, hostID, name, "user-action"); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,updated_at=now() WHERE id=$2::uuid`, spec.PendingState, instanceID); err != nil {
+		return nil, err
+	}
+	detail, _ := json.Marshal(map[string]any{"task_type": spec.TaskType})
+	_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,$2,'instance',$3,$4)`, actor, "instance."+action, instanceID, detail)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return map[string]any{"id": instanceID, "status": spec.PendingState, "task_type": spec.TaskType}, nil
+}
+
+func (s *Service) RenewInstance(ctx context.Context, actor, instanceID string, hours int) (map[string]any, error) {
+	if !uuidPattern.MatchString(instanceID) || hours < 1 || hours > 720 {
+		return nil, errors.New("instance id or renewal hours is invalid")
+	}
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	var owner, hostID, name, lifecycleStatus string
+	var retained bool
+	err = tx.QueryRow(ctx, `SELECT a.applicant,i.host_id::text,i.name,i.lifecycle_status,i.retention_until IS NOT NULL FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &hostID, &name, &lifecycleStatus, &retained)
+	if err != nil {
+		return nil, err
+	}
+	if owner != actor {
+		return nil, errors.New("instance does not belong to the current user")
+	}
+	if lifecycleStatus == "DELETING" || lifecycleStatus == "RELEASED" || lifecycleStatus == "PROVISIONING" {
+		return nil, fmt.Errorf("instance cannot be renewed from status %s", lifecycleStatus)
+	}
+	nextStatus := lifecycleStatus
+	if retained && (lifecycleStatus == "RETAINED" || lifecycleStatus == "STOPPED") {
+		if err := insertInstanceTask(ctx, tx, "START_INSTANCE", instanceID, hostID, name, "renewal"); err != nil {
+			return nil, err
+		}
+		nextStatus = "STARTING"
+	}
+	var expiresAt time.Time
+	err = tx.QueryRow(ctx, `UPDATE instances SET expires_at=greatest(expires_at,now())+make_interval(hours=>$1),retention_until=NULL,lifecycle_status=$2,updated_at=now() WHERE id=$3::uuid RETURNING expires_at`, hours, nextStatus, instanceID).Scan(&expiresAt)
+	if err != nil {
+		return nil, err
+	}
+	detail, _ := json.Marshal(map[string]any{"hours": hours, "expires_at": expiresAt})
+	_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.renew','instance',$2,$3)`, actor, instanceID, detail)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return map[string]any{"id": instanceID, "status": nextStatus, "expires_at": expiresAt}, nil
+}
+
+func insertInstanceTask(ctx context.Context, tx pgx.Tx, taskType, instanceID, hostID, name, reason string) error {
+	payload, err := json.Marshal(map[string]any{"instance_id": instanceID, "name": name, "reason": reason})
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO tasks(idempotency_key,task_type,resource_id,host_id,payload) VALUES($1 || ':' || $2 || ':' || gen_random_uuid()::text,$1,$2::uuid,$3::uuid,$4)`, taskType, instanceID, hostID, payload)
+	return err
+}
+
 func (s *Service) PollTask(ctx context.Context, hostID string) (map[string]any, error) {
 	tx, err := s.DB.Begin(ctx)
 	if err != nil {
@@ -365,8 +492,9 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 		return err
 	}
 	defer tx.Rollback(ctx)
-	var resourceID string
-	err = tx.QueryRow(ctx, `SELECT resource_id::text FROM tasks WHERE id=$1::uuid AND host_id=$2::uuid AND status='RUNNING' FOR UPDATE`, taskID, hostID).Scan(&resourceID)
+	var resourceID, taskType string
+	var attempt, maxAttempts int
+	err = tx.QueryRow(ctx, `SELECT resource_id::text,task_type,attempt,max_attempts FROM tasks WHERE id=$1::uuid AND host_id=$2::uuid AND status='RUNNING' FOR UPDATE`, taskID, hostID).Scan(&resourceID, &taskType, &attempt, &maxAttempts)
 	if err != nil {
 		return err
 	}
@@ -374,19 +502,106 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 	if result.Success {
 		_, err = tx.Exec(ctx, `UPDATE tasks SET status='SUCCEEDED',result=$1,completed_at=now(),updated_at=now() WHERE id=$2::uuid`, data, taskID)
 		if err == nil {
-			_, err = tx.Exec(ctx, `UPDATE instances SET lifecycle_status='RUNNING',provider_status='RUNNING',provider_ref=$1,ip_address=nullif($2,'')::inet,updated_at=now() WHERE id=$3::uuid`, result.ProviderRef, result.IPAddress, resourceID)
-		}
-		if err == nil {
-			_, err = tx.Exec(ctx, `UPDATE ip_addresses SET status='ALLOCATED',allocated_at=now(),updated_at=now() WHERE instance_id=$1::uuid`, resourceID)
+			err = s.applySuccessfulTask(ctx, tx, taskType, resourceID, result)
 		}
 	} else {
-		_, err = tx.Exec(ctx, `UPDATE tasks SET status=CASE WHEN attempt>=max_attempts THEN 'FAILED' ELSE 'PENDING' END,error_message=$1,available_at=now()+interval '15 seconds',updated_at=now() WHERE id=$2::uuid`, result.Error, taskID)
-		if err == nil {
-			_, _ = tx.Exec(ctx, `UPDATE instances SET lifecycle_status='ERROR',updated_at=now() WHERE id=$1::uuid`, resourceID)
+		_, err = tx.Exec(ctx, `UPDATE tasks SET status=CASE WHEN attempt>=max_attempts THEN 'FAILED' ELSE 'PENDING' END,error_message=$1,available_at=now()+interval '15 seconds',completed_at=CASE WHEN attempt>=max_attempts THEN now() ELSE NULL END,updated_at=now() WHERE id=$2::uuid`, result.Error, taskID)
+		if err == nil && attempt >= maxAttempts {
+			_, _ = tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,updated_at=now() WHERE id=$2::uuid`, terminalFailureStatus(taskType), resourceID)
 		}
 	}
 	if err != nil {
 		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Service) applySuccessfulTask(ctx context.Context, tx pgx.Tx, taskType, resourceID string, result TaskResult) error {
+	switch taskType {
+	case "CREATE_INSTANCE":
+		if _, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='RUNNING',provider_status='RUNNING',provider_ref=$1,ip_address=nullif($2,'')::inet,updated_at=now() WHERE id=$3::uuid`, result.ProviderRef, result.IPAddress, resourceID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE ip_addresses SET status='ALLOCATED',allocated_at=now(),updated_at=now() WHERE instance_id=$1::uuid`, resourceID)
+		return err
+	case "START_INSTANCE", "REBOOT_INSTANCE":
+		_, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='RUNNING',provider_status='RUNNING',updated_at=now() WHERE id=$1::uuid`, resourceID)
+		return err
+	case "STOP_INSTANCE":
+		_, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status=CASE WHEN retention_until IS NOT NULL AND expires_at<=now() THEN 'RETAINED' ELSE 'STOPPED' END,provider_status='STOPPED',updated_at=now() WHERE id=$1::uuid`, resourceID)
+		return err
+	case "DELETE_INSTANCE":
+		var hostID string
+		var cpu, memoryMB, diskGB int
+		if err := tx.QueryRow(ctx, `SELECT i.host_id::text,f.cpu,f.memory_mb,f.disk_gb FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id WHERE i.id=$1::uuid FOR UPDATE OF i`, resourceID).Scan(&hostID, &cpu, &memoryMB, &diskGB); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='RELEASED',provider_status='DELETED',provider_ref=NULL,ip_address=NULL,updated_at=now() WHERE id=$1::uuid`, resourceID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE ip_addresses SET status='FREE',instance_id=NULL,reserved_at=NULL,allocated_at=NULL,updated_at=now() WHERE instance_id=$1::uuid`, resourceID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE hosts SET reserved_cpu=greatest(0,reserved_cpu-$1),reserved_memory_mb=greatest(0,reserved_memory_mb-$2),reserved_disk_gb=greatest(0,reserved_disk_gb-$3),updated_at=now() WHERE id=$4::uuid`, cpu, memoryMB, diskGB, hostID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE applications SET status='RELEASED' WHERE id=(SELECT application_id FROM instances WHERE id=$1::uuid)`, resourceID)
+		return err
+	default:
+		return fmt.Errorf("unsupported successful task type %s", taskType)
+	}
+}
+
+func terminalFailureStatus(taskType string) string {
+	switch taskType {
+	case "START_INSTANCE":
+		return "STOPPED"
+	case "STOP_INSTANCE", "REBOOT_INSTANCE":
+		return "RUNNING"
+	case "DELETE_INSTANCE":
+		return "RETAINED"
+	default:
+		return "ERROR"
+	}
+}
+
+func (s *Service) ReconcileInstanceLifecycle(ctx context.Context) error {
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, `SELECT id::text,host_id::text,name,lifecycle_status FROM instances i WHERE ((i.lifecycle_status='RUNNING' AND i.expires_at<=now()) OR (i.lifecycle_status='RETAINED' AND i.retention_until<=now())) AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.resource_id=i.id AND t.status='FAILED' AND t.updated_at>=i.updated_at AND ((i.lifecycle_status='RUNNING' AND t.task_type='STOP_INSTANCE') OR (i.lifecycle_status='RETAINED' AND t.task_type='DELETE_INSTANCE'))) ORDER BY coalesce(i.retention_until,i.expires_at) FOR UPDATE OF i SKIP LOCKED LIMIT 50`)
+	if err != nil {
+		return err
+	}
+	type candidate struct{ id, hostID, name, status string }
+	var candidates []candidate
+	for rows.Next() {
+		var item candidate
+		if err := rows.Scan(&item.id, &item.hostID, &item.name, &item.status); err != nil {
+			rows.Close()
+			return err
+		}
+		candidates = append(candidates, item)
+	}
+	rows.Close()
+	for _, item := range candidates {
+		taskType, nextStatus, reason := "STOP_INSTANCE", "STOPPING", "lease-expired"
+		if item.status == "RETAINED" {
+			taskType, nextStatus, reason = "DELETE_INSTANCE", "DELETING", "retention-expired"
+		}
+		if err := insertInstanceTask(ctx, tx, taskType, item.id, item.hostID, item.name, reason); err != nil {
+			return err
+		}
+		if taskType == "STOP_INSTANCE" {
+			_, err = tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,retention_until=coalesce(retention_until,now()+interval '7 days'),updated_at=now() WHERE id=$2::uuid`, nextStatus, item.id)
+		} else {
+			_, err = tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,updated_at=now() WHERE id=$2::uuid`, nextStatus, item.id)
+		}
+		if err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }
@@ -404,6 +619,9 @@ func StartReconciler(ctx context.Context, service *Service) {
 			return
 		case <-ticker.C:
 			service.MarkOfflineHosts(ctx)
+			if err := service.ReconcileInstanceLifecycle(ctx); err != nil {
+				fmt.Printf("reconcile instance lifecycle: %v\n", err)
+			}
 		}
 	}
 }

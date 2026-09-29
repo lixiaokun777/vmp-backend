@@ -10,6 +10,8 @@
 - `GET /api/v1/networks`、`GET /api/v1/ip-addresses`：网络和 IP 资源池。
 - `POST /api/v1/applications`：提交虚拟机申请；成功时在 `connection` 中返回 IP、用户名和仅显示一次的初始密码。
 - `GET /api/v1/instances`：实例列表；`scope=mine` 仅查询当前用户。
+- `POST /api/v1/instances/{id}/actions`：提交 `start`、`stop`、`reboot` 或 `release` 操作。
+- `POST /api/v1/instances/{id}/renew`：按小时续期，允许 1-720 小时。
 
 ## Agent 接口
 
@@ -21,6 +23,8 @@
 ## 创建任务负载
 
 `CREATE_INSTANCE` 任务包含实例 UUID、名称、CPU、内存、磁盘、`image_file`、网桥、IP、前缀长度、网关、DNS、用户名和 `password_hash`。密码摘要由 PostgreSQL `pgcrypto` 生成，明文不写入任务、实例表或审计日志。
+
+`START_INSTANCE`、`STOP_INSTANCE`、`REBOOT_INSTANCE` 和 `DELETE_INSTANCE` 只下发实例 UUID、域名和触发原因。到期实例会先关机并进入 7 天保留期；保留期结束后才下发删除任务、释放 IP 和宿主机配额。
 
 申请成功响应示例：
 

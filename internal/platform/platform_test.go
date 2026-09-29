@@ -34,3 +34,18 @@ func TestDefaultUsername(t *testing.T) {
 		t.Fatalf("rocky username = %s", got)
 	}
 }
+
+func TestTerminalFailureStatus(t *testing.T) {
+	cases := map[string]string{
+		"CREATE_INSTANCE": "ERROR",
+		"START_INSTANCE":  "STOPPED",
+		"STOP_INSTANCE":   "RUNNING",
+		"REBOOT_INSTANCE": "RUNNING",
+		"DELETE_INSTANCE": "RETAINED",
+	}
+	for taskType, expected := range cases {
+		if got := terminalFailureStatus(taskType); got != expected {
+			t.Fatalf("%s failure status = %s, want %s", taskType, got, expected)
+		}
+	}
+}

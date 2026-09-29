@@ -36,6 +36,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/applications", a.applications)
 	mux.HandleFunc("POST /api/v1/applications", a.createApplication)
 	mux.HandleFunc("GET /api/v1/instances", a.instances)
+	mux.HandleFunc("POST /api/v1/instances/{id}/actions", a.instanceAction)
+	mux.HandleFunc("POST /api/v1/instances/{id}/renew", a.renewInstance)
 	mux.HandleFunc("GET /api/v1/tasks", a.tasks)
 	mux.HandleFunc("POST /api/v1/agents/register", a.registerAgent)
 	mux.HandleFunc("POST /api/v1/agents/{id}/heartbeat", a.agentHeartbeat)
@@ -109,7 +111,7 @@ func (a *API) instances(w http.ResponseWriter, r *http.Request) {
 		where = " WHERE a.applicant=$1"
 		args = append(args, actor)
 	}
-	a.queryListArgs(w, r, `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'host',h.name,'flavor',f.name,'image',im.name,'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'created_at',i.created_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id`+where+` ORDER BY i.created_at DESC`, args...)
+	a.queryListArgs(w, r, `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'host',h.name,'flavor',f.name,'image',im.name,'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'created_at',i.created_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id`+where+` ORDER BY i.created_at DESC`, args...)
 }
 func (a *API) tasks(w http.ResponseWriter, r *http.Request) {
 	a.queryList(w, r, `SELECT jsonb_build_object('id',id,'task_type',task_type,'status',status,'attempt',attempt,'error_message',error_message,'created_at',created_at,'completed_at',completed_at) FROM tasks ORDER BY created_at DESC LIMIT 100`)
@@ -265,6 +267,46 @@ func (a *API) createApplication(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, result)
+}
+
+func (a *API) instanceAction(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	actor := r.Header.Get("X-User")
+	if actor == "" {
+		actor = "developer"
+	}
+	result, err := a.Service.PerformInstanceAction(r.Context(), actor, r.PathValue("id"), in.Action)
+	if err != nil {
+		writeError(w, 422, err.Error())
+		return
+	}
+	writeJSON(w, 202, result)
+}
+
+func (a *API) renewInstance(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Hours int `json:"hours"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	actor := r.Header.Get("X-User")
+	if actor == "" {
+		actor = "developer"
+	}
+	result, err := a.Service.RenewInstance(r.Context(), actor, r.PathValue("id"), in.Hours)
+	if err != nil {
+		writeError(w, 422, err.Error())
+		return
+	}
+	writeJSON(w, 200, result)
 }
 
 func (a *API) registerAgent(w http.ResponseWriter, r *http.Request) {
