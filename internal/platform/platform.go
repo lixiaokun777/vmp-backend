@@ -417,6 +417,32 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor, instanceID, 
 		}
 		return map[string]any{"id": instanceID, "status": lifecycleStatus, "retention_days": 7}, nil
 	}
+	if action == "force_delete" {
+		if lifecycleStatus == "RELEASED" {
+			return map[string]any{"id": instanceID, "status": lifecycleStatus}, tx.Commit(ctx)
+		}
+		if lifecycleStatus != "RUNNING" && lifecycleStatus != "STOPPED" && lifecycleStatus != "RETAINED" && lifecycleStatus != "ERROR" {
+			return nil, fmt.Errorf("instance cannot be force deleted from status %s", lifecycleStatus)
+		}
+		var activeTasks int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE resource_id=$1::uuid AND status IN ('PENDING','RUNNING')`, instanceID).Scan(&activeTasks); err != nil {
+			return nil, err
+		}
+		if activeTasks > 0 {
+			return nil, errors.New("instance still has an active task")
+		}
+		if err := insertInstanceTask(ctx, tx, "DELETE_INSTANCE", instanceID, hostID, name, "force-delete"); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='DELETING',retention_until=now(),updated_at=now() WHERE id=$1::uuid`, instanceID); err != nil {
+			return nil, err
+		}
+		_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.force_delete','instance',$2,'{"retention_days":0}'::jsonb)`, actor, instanceID)
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return map[string]any{"id": instanceID, "status": "DELETING", "retention_days": 0, "task_type": "DELETE_INSTANCE"}, nil
+	}
 	spec, ok := instanceActionTasks[action]
 	if !ok {
 		return nil, errors.New("unsupported instance action")

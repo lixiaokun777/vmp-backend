@@ -29,16 +29,21 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/hosts", a.hosts)
 	mux.HandleFunc("PATCH /api/v1/hosts/{id}/status", a.hostStatus)
 	mux.HandleFunc("PATCH /api/v1/hosts/{id}/quota", a.hostQuota)
+	mux.HandleFunc("DELETE /api/v1/hosts/{id}", a.deleteHost)
 	mux.HandleFunc("GET /api/v1/flavors", a.flavors)
 	mux.HandleFunc("POST /api/v1/flavors", a.createFlavor)
 	mux.HandleFunc("PATCH /api/v1/flavors/{id}", a.updateFlavor)
+	mux.HandleFunc("DELETE /api/v1/flavors/{id}", a.deleteFlavor)
 	mux.HandleFunc("GET /api/v1/images", a.images)
 	mux.HandleFunc("POST /api/v1/images", a.createImage)
 	mux.HandleFunc("PATCH /api/v1/images/{id}", a.updateImage)
+	mux.HandleFunc("DELETE /api/v1/images/{id}", a.deleteImage)
 	mux.HandleFunc("GET /api/v1/networks", a.networks)
 	mux.HandleFunc("POST /api/v1/networks", a.createNetwork)
 	mux.HandleFunc("PATCH /api/v1/networks/{id}", a.updateNetwork)
+	mux.HandleFunc("DELETE /api/v1/networks/{id}", a.deleteNetwork)
 	mux.HandleFunc("POST /api/v1/networks/{id}/ip-ranges", a.addIPRange)
+	mux.HandleFunc("DELETE /api/v1/networks/{id}/ip-ranges", a.deleteIPRange)
 	mux.HandleFunc("GET /api/v1/ip-addresses", a.ipAddresses)
 	mux.HandleFunc("GET /api/v1/applications", a.applications)
 	mux.HandleFunc("POST /api/v1/applications", a.createApplication)
@@ -275,6 +280,42 @@ func (a *API) updateNetwork(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"id": r.PathValue("id"), "updated": true})
 }
 
+func (a *API) deleteNetwork(w http.ResponseWriter, r *http.Request) {
+	tx, err := a.Service.DB.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+	var name string
+	if err := tx.QueryRow(r.Context(), `SELECT name FROM networks WHERE id=$1::uuid FOR UPDATE`, r.PathValue("id")).Scan(&name); err != nil {
+		writeError(w, 404, "网络不存在")
+		return
+	}
+	var occupied int
+	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM ip_addresses WHERE network_id=$1::uuid AND status<>'FREE'`, r.PathValue("id")).Scan(&occupied); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if occupied > 0 {
+		writeError(w, 409, "网络中仍有已分配、预留或隔离的 IP，不能删除")
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `DELETE FROM ip_addresses WHERE network_id=$1::uuid`, r.PathValue("id")); err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `DELETE FROM networks WHERE id=$1::uuid`, r.PathValue("id")); err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": r.PathValue("id"), "name": name, "deleted": true})
+}
+
 func (a *API) addIPRange(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Start string `json:"start"`
@@ -323,6 +364,75 @@ func (a *API) addIPRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, map[string]any{"inserted": tag.RowsAffected(), "probe_policy": "Agent allocates only after an ICMP occupancy probe"})
+}
+
+func (a *API) deleteIPRange(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Start string `json:"start"`
+		End   string `json:"end"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil {
+		writeError(w, 400, "JSON 格式无效")
+		return
+	}
+	start, startErr := netip.ParseAddr(in.Start)
+	end, endErr := netip.ParseAddr(in.End)
+	if startErr != nil || endErr != nil || !start.Is4() || !end.Is4() || start.Compare(end) > 0 {
+		writeError(w, 422, "IPv4 地址范围无效")
+		return
+	}
+	tx, err := a.Service.DB.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+	var cidr string
+	if err := tx.QueryRow(r.Context(), `SELECT cidr::text FROM networks WHERE id=$1::uuid FOR UPDATE`, r.PathValue("id")).Scan(&cidr); err != nil {
+		writeError(w, 404, "网络不存在")
+		return
+	}
+	prefix, _ := netip.ParsePrefix(cidr)
+	if !prefix.Contains(start) || !prefix.Contains(end) {
+		writeError(w, 422, "IP 地址范围必须位于网络 CIDR 内")
+		return
+	}
+	rows, err := tx.Query(r.Context(), `SELECT status FROM ip_addresses WHERE network_id=$1::uuid AND address BETWEEN $2::inet AND $3::inet FOR UPDATE`, r.PathValue("id"), in.Start, in.End)
+	if err != nil {
+		writeError(w, 422, err.Error())
+		return
+	}
+	count := 0
+	occupied := false
+	for rows.Next() {
+		var status string
+		if err := rows.Scan(&status); err != nil {
+			rows.Close()
+			writeError(w, 500, err.Error())
+			return
+		}
+		count++
+		occupied = occupied || status != "FREE"
+	}
+	rows.Close()
+	if occupied {
+		writeError(w, 409, "范围中包含已分配、预留或隔离的 IP，不能删除")
+		return
+	}
+	if count == 0 {
+		writeError(w, 404, "指定范围中没有可删除的 IP")
+		return
+	}
+	tag, err := tx.Exec(r.Context(), `DELETE FROM ip_addresses WHERE network_id=$1::uuid AND address BETWEEN $2::inet AND $3::inet`, r.PathValue("id"), in.Start, in.End)
+	if err != nil {
+		writeError(w, 422, err.Error())
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": tag.RowsAffected()})
 }
 
 func (a *API) ipAddresses(w http.ResponseWriter, r *http.Request) {
@@ -380,6 +490,54 @@ func (a *API) hostQuota(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"cpu": in.CPU, "memory_mb": in.MemoryMB, "disk_gb": in.DiskGB})
 }
 
+func (a *API) deleteHost(w http.ResponseWriter, r *http.Request) {
+	tx, err := a.Service.DB.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+	var name, status string
+	if err := tx.QueryRow(r.Context(), `SELECT name,status FROM hosts WHERE id=$1::uuid FOR UPDATE`, r.PathValue("id")).Scan(&name, &status); err != nil {
+		writeError(w, 404, "宿主机不存在")
+		return
+	}
+	if status != "OFFLINE" {
+		writeError(w, 409, "必须先停止 Agent 并等待宿主机变为 OFFLINE，才能删除纳管记录")
+		return
+	}
+	var activeInstances, activeTasks int
+	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM instances WHERE host_id=$1::uuid AND lifecycle_status<>'RELEASED'`, r.PathValue("id")).Scan(&activeInstances); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM tasks WHERE host_id=$1::uuid AND status IN ('PENDING','RUNNING')`, r.PathValue("id")).Scan(&activeTasks); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if activeInstances > 0 || activeTasks > 0 {
+		writeError(w, 409, "宿主机仍有关联实例或待执行任务，不能删除")
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `UPDATE instances SET host_id=NULL WHERE host_id=$1::uuid`, r.PathValue("id")); err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `UPDATE tasks SET host_id=NULL WHERE host_id=$1::uuid`, r.PathValue("id")); err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `DELETE FROM hosts WHERE id=$1::uuid`, r.PathValue("id")); err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": r.PathValue("id"), "name": name, "deleted": true})
+}
+
 type flavorInput struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
@@ -414,6 +572,19 @@ func (a *API) updateFlavor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"enabled": *in.Enabled})
+}
+
+func (a *API) deleteFlavor(w http.ResponseWriter, r *http.Request) {
+	tag, err := a.Service.DB.Exec(r.Context(), `DELETE FROM flavors f WHERE f.id=$1 AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.flavor_id=f.id)`, r.PathValue("id"))
+	if err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		writeError(w, 409, "规格不存在或已被申请记录引用；已使用的规格只能停用")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": r.PathValue("id"), "deleted": true})
 }
 
 type imageInput struct {
@@ -527,6 +698,19 @@ func (a *API) updateImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"enabled": *in.Enabled})
+}
+
+func (a *API) deleteImage(w http.ResponseWriter, r *http.Request) {
+	tag, err := a.Service.DB.Exec(r.Context(), `DELETE FROM images i WHERE i.id=$1 AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.image_id=i.id)`, r.PathValue("id"))
+	if err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		writeError(w, 409, "镜像不存在或已被申请记录引用；已使用的镜像只能停用")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": r.PathValue("id"), "deleted": true})
 }
 
 func (a *API) createApplication(w http.ResponseWriter, r *http.Request) {
