@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"testing"
 )
@@ -13,6 +14,45 @@ func TestTokenOK(t *testing.T) {
 	}
 	if tokenOK(req, "different-token", "Authorization") {
 		t.Fatal("expected mismatched bearer token to be rejected")
+	}
+}
+
+func TestPasswordPolicy(t *testing.T) {
+	if err := validatePassword("StrongPass123"); err != nil {
+		t.Fatalf("valid password was rejected: %v", err)
+	}
+	for _, password := range []string{"short1A", "onlylowercase1", "ONLYUPPERCASE1", "NoDigitsHere"} {
+		if validatePassword(password) == nil {
+			t.Fatalf("invalid password was accepted: %s", password)
+		}
+	}
+}
+
+func TestOrdinaryUserRoutePolicy(t *testing.T) {
+	allowed := []*http.Request{
+		httptest.NewRequest("GET", "/api/v1/flavors", nil),
+		httptest.NewRequest("POST", "/api/v1/applications", nil),
+		httptest.NewRequest("GET", "/api/v1/instances?all=1", nil),
+		httptest.NewRequest("GET", "/api/v1/instances/00000000-0000-0000-0000-000000000000", nil),
+		httptest.NewRequest("POST", "/api/v1/instances/00000000-0000-0000-0000-000000000000/actions", nil),
+		httptest.NewRequest("POST", "/api/v1/instances/00000000-0000-0000-0000-000000000000/renew", nil),
+	}
+	for _, request := range allowed {
+		if !ordinaryUserRouteAllowed(request) {
+			t.Fatalf("ordinary user route should be allowed: %s %s", request.Method, request.URL.Path)
+		}
+	}
+	denied := []*http.Request{
+		httptest.NewRequest("GET", "/api/v1/summary", nil),
+		httptest.NewRequest("GET", "/api/v1/hosts", nil),
+		httptest.NewRequest("GET", "/api/v1/users", nil),
+		httptest.NewRequest("POST", "/api/v1/networks", nil),
+		httptest.NewRequest("POST", "/api/v1/instances/00000000-0000-0000-0000-000000000000/admin-operation", nil),
+	}
+	for _, request := range denied {
+		if ordinaryUserRouteAllowed(request) {
+			t.Fatalf("ordinary user route should be denied: %s %s", request.Method, request.URL.Path)
+		}
 	}
 }
 

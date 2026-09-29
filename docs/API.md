@@ -1,5 +1,16 @@
 # API 说明
 
+## 登录与用户
+
+- `POST /api/v1/auth/login`：本地用户使用平台密码，LDAP 用户使用目录密码；成功后写入 HttpOnly 会话 Cookie。
+- `POST /api/v1/auth/logout`、`GET /api/v1/auth/me`：退出登录和读取当前账号。
+- `POST /api/v1/auth/password`：本地用户修改自己的密码，修改成功后清理该账号的其他登录会话。
+- `GET/POST/PATCH/DELETE /api/v1/users`：管理员查询、创建、更新和删除用户。
+- `POST /api/v1/users/{id}/password`：管理员重置本地用户密码并清除其现有会话。
+- `GET /api/v1/ldap/status`、`POST /api/v1/ldap/sync`：管理员查看 LDAP 配置状态并同步目录用户。
+
+除健康检查、登录和 Agent 通信外，所有接口均要求有效会话。管理员可访问全部平台管理接口；普通用户只可读取申请所需的规格、镜像和网络，提交申请，并查看、续期或操作自己的实例。服务端不信任客户端传入的用户名。
+
 ## 业务接口
 
 - `GET /api/v1/health`：健康检查。
@@ -47,4 +58,4 @@
 }
 ```
 
-当前为内网第一版协议，正式上线前需要增加用户身份认证、授权和令牌轮换。
+当前为内网第一版协议，已启用用户身份认证和角色授权。正式上线前还需通过 HTTPS 传输会话 Cookie，并定期轮换 Agent 令牌。

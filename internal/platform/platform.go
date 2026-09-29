@@ -353,7 +353,7 @@ var instanceActionTasks = map[string]struct {
 	"reboot": {TaskType: "REBOOT_INSTANCE", RequiredFrom: "RUNNING", PendingState: "REBOOTING"},
 }
 
-func (s *Service) PerformInstanceAction(ctx context.Context, actor, instanceID, action string) (map[string]any, error) {
+func (s *Service) PerformInstanceAction(ctx context.Context, actor string, administrator bool, instanceID, action string) (map[string]any, error) {
 	if !uuidPattern.MatchString(instanceID) {
 		return nil, errors.New("invalid instance id")
 	}
@@ -369,7 +369,7 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor, instanceID, 
 	if err != nil {
 		return nil, err
 	}
-	if owner != actor {
+	if owner != actor && !administrator {
 		return nil, errors.New("instance does not belong to the current user")
 	}
 	if action == "retry" {
@@ -467,7 +467,7 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor, instanceID, 
 	return map[string]any{"id": instanceID, "status": spec.PendingState, "task_type": spec.TaskType}, nil
 }
 
-func (s *Service) RenewInstance(ctx context.Context, actor, instanceID string, hours int) (map[string]any, error) {
+func (s *Service) RenewInstance(ctx context.Context, actor string, administrator bool, instanceID string, hours int) (map[string]any, error) {
 	if !uuidPattern.MatchString(instanceID) || hours < 1 || hours > 720 {
 		return nil, errors.New("instance id or renewal hours is invalid")
 	}
@@ -482,7 +482,7 @@ func (s *Service) RenewInstance(ctx context.Context, actor, instanceID string, h
 	if err != nil {
 		return nil, err
 	}
-	if owner != actor {
+	if owner != actor && !administrator {
 		return nil, errors.New("instance does not belong to the current user")
 	}
 	if lifecycleStatus == "DELETING" || lifecycleStatus == "RELEASED" || lifecycleStatus == "PROVISIONING" {

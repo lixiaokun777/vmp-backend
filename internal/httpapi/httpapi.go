@@ -20,11 +20,25 @@ type API struct {
 	Service        *platform.Service
 	BootstrapToken string
 	AgentToken     string
+	SessionTTL     time.Duration
+	SessionSecure  bool
+	LDAP           LDAPConfig
 }
 
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", a.health)
+	mux.HandleFunc("POST /api/v1/auth/login", a.authLogin)
+	mux.HandleFunc("POST /api/v1/auth/logout", a.authLogout)
+	mux.HandleFunc("GET /api/v1/auth/me", a.authMe)
+	mux.HandleFunc("POST /api/v1/auth/password", a.changeOwnPassword)
+	mux.HandleFunc("GET /api/v1/users", a.users)
+	mux.HandleFunc("POST /api/v1/users", a.createLocalUser)
+	mux.HandleFunc("PATCH /api/v1/users/{id}", a.updateUser)
+	mux.HandleFunc("POST /api/v1/users/{id}/password", a.resetLocalUserPassword)
+	mux.HandleFunc("DELETE /api/v1/users/{id}", a.deleteUser)
+	mux.HandleFunc("GET /api/v1/ldap/status", a.ldapStatus)
+	mux.HandleFunc("POST /api/v1/ldap/sync", a.ldapSync)
 	mux.HandleFunc("GET /api/v1/summary", a.summary)
 	mux.HandleFunc("GET /api/v1/hosts", a.hosts)
 	mux.HandleFunc("PATCH /api/v1/hosts/{id}/status", a.hostStatus)
@@ -56,7 +70,10 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/agents/{id}/heartbeat", a.agentHeartbeat)
 	mux.HandleFunc("GET /api/v1/agents/{id}/tasks/next", a.agentTask)
 	mux.HandleFunc("POST /api/v1/agents/{id}/tasks/{taskID}/result", a.agentTaskResult)
-	return withMiddleware(mux)
+	if a.SessionTTL <= 0 {
+		a.SessionTTL = 12 * time.Hour
+	}
+	return withMiddleware(a.authenticate(mux))
 }
 
 func withMiddleware(next http.Handler) http.Handler {
@@ -101,13 +118,19 @@ func (a *API) hosts(w http.ResponseWriter, r *http.Request) {
 	a.queryList(w, r, `SELECT jsonb_build_object('id',h.id,'name',h.name,'provider_type',h.provider_type,'agent_mode',h.agent_mode,'status',h.status,'management_ip',h.management_ip,'allocatable_cpu',h.allocatable_cpu,'allocatable_memory_mb',h.allocatable_memory_mb,'allocatable_disk_gb',h.allocatable_disk_gb,'agent_allocatable_cpu',h.agent_allocatable_cpu,'agent_allocatable_memory_mb',h.agent_allocatable_memory_mb,'agent_allocatable_disk_gb',h.agent_allocatable_disk_gb,'quota_cpu',h.quota_cpu,'quota_memory_mb',h.quota_memory_mb,'quota_disk_gb',h.quota_disk_gb,'reserved_cpu',h.reserved_cpu,'reserved_memory_mb',h.reserved_memory_mb,'reserved_disk_gb',h.reserved_disk_gb,'last_heartbeat_at',h.last_heartbeat_at,'last_inventory_at',h.last_inventory_at,'facts',h.facts,'discovered_instances',(SELECT count(*) FROM discovered_instances d WHERE d.host_id=h.id),'external_instances',(SELECT count(*) FROM discovered_instances d WHERE d.host_id=h.id AND d.ownership='EXTERNAL')) FROM hosts h`+filter+` ORDER BY h.name`)
 }
 func (a *API) flavors(w http.ResponseWriter, r *http.Request) {
+	user, _ := userFromRequest(r)
 	filter := " WHERE enabled"
-	if r.URL.Query().Get("all") == "1" {
+	if user.Role == "ADMIN" && r.URL.Query().Get("all") == "1" {
 		filter = ""
 	}
 	a.queryList(w, r, `SELECT jsonb_build_object('id',id,'name',name,'cpu',cpu,'memory_mb',memory_mb,'disk_gb',disk_gb,'enabled',enabled) FROM flavors`+filter+` ORDER BY cpu`)
 }
 func (a *API) images(w http.ResponseWriter, r *http.Request) {
+	user, _ := userFromRequest(r)
+	if user.Role != "ADMIN" {
+		a.queryList(w, r, `SELECT jsonb_build_object('id',id,'name',name,'os_family',os_family,'version',version) FROM images WHERE enabled AND sync_status='READY' ORDER BY name`)
+		return
+	}
 	filter := " WHERE enabled"
 	if r.URL.Query().Get("all") == "1" {
 		filter = ""
@@ -118,30 +141,24 @@ func (a *API) applications(w http.ResponseWriter, r *http.Request) {
 	a.queryList(w, r, `SELECT jsonb_build_object('id',a.id,'request_no',a.request_no,'applicant',a.applicant,'instance_name',a.instance_name,'purpose',a.purpose,'flavor',f.name,'image',i.name,'lease_hours',a.lease_hours,'status',a.status,'created_at',a.created_at) FROM applications a JOIN flavors f ON f.id=a.flavor_id JOIN images i ON i.id=a.image_id ORDER BY a.created_at DESC`)
 }
 func (a *API) instances(w http.ResponseWriter, r *http.Request) {
-	actor := r.Header.Get("X-User")
-	if actor == "" {
-		actor = "developer"
-	}
+	user, _ := userFromRequest(r)
 	filters := []string{"i.lifecycle_status<>'RELEASED'"}
 	args := []any{}
 	if r.URL.Query().Get("all") != "1" {
 		filters = append(filters, "h.agent_mode<>'mock'")
 	}
-	if r.URL.Query().Get("scope") == "mine" {
+	if user.Role != "ADMIN" || r.URL.Query().Get("scope") == "mine" {
 		filters = append(filters, "a.applicant=$1")
-		args = append(args, actor)
+		args = append(args, user.Username)
 	}
 	where := " WHERE " + strings.Join(filters, " AND ")
 	a.queryListArgs(w, r, `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'host',h.name,'flavor',f.name,'image',im.name,'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'created_at',i.created_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id`+where+` ORDER BY i.created_at DESC`, args...)
 }
 
 func (a *API) instanceDetail(w http.ResponseWriter, r *http.Request) {
-	actor := r.Header.Get("X-User")
-	if actor == "" {
-		actor = "developer"
-	}
+	user, _ := userFromRequest(r)
 	var instance json.RawMessage
-	err := a.Service.DB.QueryRow(r.Context(), `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'purpose',a.purpose,'request_no',a.request_no,'host',h.name,'host_id',i.host_id,'flavor',jsonb_build_object('id',f.id,'name',f.name,'cpu',f.cpu,'memory_mb',f.memory_mb,'disk_gb',f.disk_gb),'image',jsonb_build_object('id',im.id,'name',im.name,'source_type',im.source_type,'source_location',im.source_location,'sync_status',im.sync_status),'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'provider_ref',i.provider_ref,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'created_at',i.created_at,'updated_at',i.updated_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id WHERE i.id=$1::uuid AND a.applicant=$2`, r.PathValue("id"), actor).Scan(&instance)
+	err := a.Service.DB.QueryRow(r.Context(), `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'purpose',a.purpose,'request_no',a.request_no,'host',h.name,'host_id',i.host_id,'flavor',jsonb_build_object('id',f.id,'name',f.name,'cpu',f.cpu,'memory_mb',f.memory_mb,'disk_gb',f.disk_gb),'image',jsonb_build_object('id',im.id,'name',im.name,'source_type',im.source_type,'source_location',im.source_location,'sync_status',im.sync_status),'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'provider_ref',i.provider_ref,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'created_at',i.created_at,'updated_at',i.updated_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id WHERE i.id=$1::uuid AND ($3 OR a.applicant=$2)`, r.PathValue("id"), user.Username, user.Role == "ADMIN").Scan(&instance)
 	if err != nil {
 		writeError(w, 404, "instance not found")
 		return
@@ -821,11 +838,8 @@ func (a *API) createApplication(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid JSON")
 		return
 	}
-	actor := r.Header.Get("X-User")
-	if actor == "" {
-		actor = "developer"
-	}
-	result, err := a.Service.CreateApplication(r.Context(), actor, in)
+	user, _ := userFromRequest(r)
+	result, err := a.Service.CreateApplication(r.Context(), user.Username, in)
 	if err != nil {
 		writeError(w, 422, err.Error())
 		return
@@ -841,11 +855,8 @@ func (a *API) instanceAction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid JSON")
 		return
 	}
-	actor := r.Header.Get("X-User")
-	if actor == "" {
-		actor = "developer"
-	}
-	result, err := a.Service.PerformInstanceAction(r.Context(), actor, r.PathValue("id"), in.Action)
+	user, _ := userFromRequest(r)
+	result, err := a.Service.PerformInstanceAction(r.Context(), user.Username, user.Role == "ADMIN", r.PathValue("id"), in.Action)
 	if err != nil {
 		writeError(w, 422, err.Error())
 		return
@@ -861,11 +872,8 @@ func (a *API) renewInstance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid JSON")
 		return
 	}
-	actor := r.Header.Get("X-User")
-	if actor == "" {
-		actor = "developer"
-	}
-	result, err := a.Service.RenewInstance(r.Context(), actor, r.PathValue("id"), in.Hours)
+	user, _ := userFromRequest(r)
+	result, err := a.Service.RenewInstance(r.Context(), user.Username, user.Role == "ADMIN", r.PathValue("id"), in.Hours)
 	if err != nil {
 		writeError(w, 422, err.Error())
 		return
