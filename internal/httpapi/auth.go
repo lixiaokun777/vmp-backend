@@ -35,12 +35,21 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		Source   string `json:"source"`
 	}
 	if json.NewDecoder(r.Body).Decode(&input) != nil {
 		writeError(w, 400, "登录信息格式无效")
 		return
 	}
 	input.Username = strings.TrimSpace(input.Username)
+	input.Source = strings.ToUpper(strings.TrimSpace(input.Source))
+	if input.Source == "" {
+		input.Source = "LOCAL"
+	}
+	if input.Source != "LOCAL" && input.Source != "LDAP" {
+		writeError(w, 422, "登录类型无效")
+		return
+	}
 	if input.Username == "" || input.Password == "" {
 		writeError(w, 422, "请输入用户名和密码")
 		return
@@ -49,13 +58,13 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 	var enabled bool
 	var passwordOK bool
 	var ldapDN string
-	err := a.Service.DB.QueryRow(r.Context(), `SELECT id::text,username,display_name,email,role,source,enabled,must_change_password,coalesce(ldap_dn,''),CASE WHEN source='LOCAL' THEN password_hash=crypt($2,password_hash) ELSE false END FROM users WHERE lower(username)=lower($1)`, input.Username, input.Password).Scan(&user.ID, &user.Username, &user.DisplayName, &user.Email, &user.Role, &user.Source, &enabled, &user.MustChangePassword, &ldapDN, &passwordOK)
+	err := a.Service.DB.QueryRow(r.Context(), `SELECT id::text,username,display_name,email,role,source,enabled,must_change_password,coalesce(ldap_dn,''),CASE WHEN source='LOCAL' THEN password_hash=crypt($2,password_hash) ELSE false END FROM users WHERE lower(username)=lower($1) AND source=$3`, input.Username, input.Password, input.Source).Scan(&user.ID, &user.Username, &user.DisplayName, &user.Email, &user.Role, &user.Source, &enabled, &user.MustChangePassword, &ldapDN, &passwordOK)
 	if err != nil || !enabled {
 		writeError(w, 401, "用户名或密码错误")
 		return
 	}
 	if user.Source == "LDAP" {
-		if err := a.authenticateLDAP(ldapDN, input.Password); err != nil {
+		if err := a.authenticateLDAP(r.Context(), ldapDN, input.Password); err != nil {
 			writeError(w, 401, "用户名或密码错误")
 			return
 		}

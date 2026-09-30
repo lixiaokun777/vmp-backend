@@ -2,12 +2,13 @@
 
 ## 登录与用户
 
-- `POST /api/v1/auth/login`：本地用户使用平台密码，LDAP 用户使用目录密码；成功后写入 HttpOnly 会话 Cookie。
+- `POST /api/v1/auth/login`：请求通过 `source=LOCAL|LDAP` 明确选择平台账号或 LDAP 账号；账号来源不匹配时拒绝登录。成功后写入 HttpOnly 会话 Cookie。
 - `POST /api/v1/auth/logout`、`GET /api/v1/auth/me`：退出登录和读取当前账号。
 - `POST /api/v1/auth/password`：本地用户修改自己的密码，修改成功后清理该账号的其他登录会话。
 - `GET/POST/PATCH/DELETE /api/v1/users`：管理员查询、创建、更新和删除用户。
 - `POST /api/v1/users/{id}/password`：管理员重置本地用户密码并清除其现有会话。
-- `GET /api/v1/ldap/status`、`POST /api/v1/ldap/sync`：管理员查看 LDAP 配置状态并同步目录用户。
+- `GET /api/v1/ldap/status`、`PUT /api/v1/ldap/config`：管理员查看并保存 LDAP 配置，响应不返回绑定密码。
+- `POST /api/v1/ldap/test`、`POST /api/v1/ldap/sync`：管理员测试目录连接并同步用户。
 
 除健康检查、登录和 Agent 通信外，所有接口均要求有效会话。管理员可访问全部平台管理接口；普通用户只可读取申请所需的规格、镜像和网络，提交申请，并查看、续期或操作自己的实例。服务端不信任客户端传入的用户名。
 

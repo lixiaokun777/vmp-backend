@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"log/slog"
 	"net/http"
 	"os"
@@ -27,12 +28,14 @@ func main() {
 	defer service.DB.Close()
 	go platform.StartReconciler(ctx, service)
 	api := &httpapi.API{
-		Service:        service,
-		BootstrapToken: env("AGENT_BOOTSTRAP_TOKEN", "dev-bootstrap-token"),
-		AgentToken:     env("AGENT_RUNTIME_TOKEN", "dev-agent-token"),
-		SessionTTL:     time.Duration(envInt("SESSION_TTL_HOURS", 12)) * time.Hour,
-		SessionSecure:  envBool("SESSION_COOKIE_SECURE", false),
+		Service:               service,
+		BootstrapToken:        env("AGENT_BOOTSTRAP_TOKEN", "dev-bootstrap-token"),
+		AgentToken:            env("AGENT_RUNTIME_TOKEN", "dev-agent-token"),
+		SessionTTL:            time.Duration(envInt("SESSION_TTL_HOURS", 12)) * time.Hour,
+		SessionSecure:         envBool("SESSION_COOKIE_SECURE", false),
+		SettingsEncryptionKey: settingsEncryptionKey(os.Getenv("SETTINGS_ENCRYPTION_KEY")),
 		LDAP: httpapi.LDAPConfig{
+			Active:          os.Getenv("LDAP_URL") != "",
 			URL:             os.Getenv("LDAP_URL"),
 			BindDN:          os.Getenv("LDAP_BIND_DN"),
 			BindPassword:    os.Getenv("LDAP_BIND_PASSWORD"),
@@ -61,6 +64,14 @@ func main() {
 		slog.Error("server failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+func settingsEncryptionKey(secret string) []byte {
+	if secret == "" {
+		return nil
+	}
+	hash := sha256.Sum256([]byte(secret))
+	return hash[:]
 }
 
 func env(key, fallback string) string {

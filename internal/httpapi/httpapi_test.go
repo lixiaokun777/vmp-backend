@@ -28,6 +28,33 @@ func TestPasswordPolicy(t *testing.T) {
 	}
 }
 
+func TestLDAPConfigurationValidation(t *testing.T) {
+	valid := LDAPConfig{Active: true, URL: "ldaps://ldap.example.com:636", BaseDN: "dc=example,dc=com", LoginFilter: "(uid=%s)", SyncFilter: "(objectClass=person)", UsernameAttr: "uid", DisplayNameAttr: "cn", EmailAttr: "mail"}
+	if err := validateLDAPConfig(valid); err != nil {
+		t.Fatalf("valid LDAP configuration was rejected: %v", err)
+	}
+	invalid := valid
+	invalid.LoginFilter = "(uid=missing-placeholder)"
+	if validateLDAPConfig(invalid) == nil {
+		t.Fatal("LDAP login filter without placeholder was accepted")
+	}
+}
+
+func TestLDAPSecretEncryption(t *testing.T) {
+	key := []byte("01234567890123456789012345678901")
+	ciphertext, err := encryptSecret(key, []byte("directory-password"))
+	if err != nil {
+		t.Fatalf("LDAP secret encryption failed: %v", err)
+	}
+	plaintext, err := decryptSecret(key, ciphertext)
+	if err != nil || string(plaintext) != "directory-password" {
+		t.Fatalf("LDAP secret decryption failed: %v", err)
+	}
+	if string(ciphertext) == "directory-password" {
+		t.Fatal("LDAP secret was not encrypted")
+	}
+}
+
 func TestOrdinaryUserRoutePolicy(t *testing.T) {
 	allowed := []*http.Request{
 		httptest.NewRequest("GET", "/api/v1/flavors", nil),

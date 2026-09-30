@@ -17,12 +17,13 @@ import (
 )
 
 type API struct {
-	Service        *platform.Service
-	BootstrapToken string
-	AgentToken     string
-	SessionTTL     time.Duration
-	SessionSecure  bool
-	LDAP           LDAPConfig
+	Service               *platform.Service
+	BootstrapToken        string
+	AgentToken            string
+	SessionTTL            time.Duration
+	SessionSecure         bool
+	SettingsEncryptionKey []byte
+	LDAP                  LDAPConfig
 }
 
 func (a *API) Handler() http.Handler {
@@ -38,6 +39,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/users/{id}/password", a.resetLocalUserPassword)
 	mux.HandleFunc("DELETE /api/v1/users/{id}", a.deleteUser)
 	mux.HandleFunc("GET /api/v1/ldap/status", a.ldapStatus)
+	mux.HandleFunc("PUT /api/v1/ldap/config", a.updateLDAPConfig)
+	mux.HandleFunc("POST /api/v1/ldap/test", a.ldapTest)
 	mux.HandleFunc("POST /api/v1/ldap/sync", a.ldapSync)
 	mux.HandleFunc("GET /api/v1/summary", a.summary)
 	mux.HandleFunc("GET /api/v1/hosts", a.hosts)
