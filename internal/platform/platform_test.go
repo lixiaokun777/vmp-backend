@@ -37,11 +37,12 @@ func TestDefaultUsername(t *testing.T) {
 
 func TestTerminalFailureStatus(t *testing.T) {
 	cases := map[string]string{
-		"CREATE_INSTANCE": "ERROR",
-		"START_INSTANCE":  "STOPPED",
-		"STOP_INSTANCE":   "RUNNING",
-		"REBOOT_INSTANCE": "RUNNING",
-		"DELETE_INSTANCE": "RETAINED",
+		"CREATE_INSTANCE":         "ERROR",
+		"START_INSTANCE":          "STOPPED",
+		"STOP_INSTANCE":           "RUNNING",
+		"REBOOT_INSTANCE":         "RUNNING",
+		"DELETE_INSTANCE":         "RETAINED",
+		"RESET_INSTANCE_PASSWORD": "RUNNING",
 	}
 	for taskType, expected := range cases {
 		if got := terminalFailureStatus(taskType); got != expected {

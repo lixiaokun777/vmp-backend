@@ -363,14 +363,49 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	var owner, hostID, name, lifecycleStatus string
+	var owner, hostID, name, username, ipAddress, lifecycleStatus string
 	var expiresAt time.Time
-	err = tx.QueryRow(ctx, `SELECT a.applicant,i.host_id::text,i.name,i.lifecycle_status,i.expires_at FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &hostID, &name, &lifecycleStatus, &expiresAt)
+	err = tx.QueryRow(ctx, `SELECT a.applicant,i.host_id::text,i.name,coalesce(i.username,''),coalesce(host(i.ip_address),''),i.lifecycle_status,i.expires_at FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &hostID, &name, &username, &ipAddress, &lifecycleStatus, &expiresAt)
 	if err != nil {
 		return nil, err
 	}
 	if owner != actor && !administrator {
 		return nil, errors.New("instance does not belong to the current user")
+	}
+	if action == "reset_password" {
+		if lifecycleStatus != "RUNNING" {
+			return nil, fmt.Errorf("instance password cannot be reset from status %s", lifecycleStatus)
+		}
+		if username == "" {
+			return nil, errors.New("instance login username is unavailable")
+		}
+		var activeTasks int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE resource_id=$1::uuid AND status IN ('PENDING','RUNNING')`, instanceID).Scan(&activeTasks); err != nil {
+			return nil, err
+		}
+		if activeTasks > 0 {
+			return nil, errors.New("instance still has an active task")
+		}
+		password, err := generatePassword(20)
+		if err != nil {
+			return nil, err
+		}
+		var passwordHash string
+		if err := tx.QueryRow(ctx, `SELECT crypt($1,gen_salt('bf',12))`, password).Scan(&passwordHash); err != nil {
+			return nil, fmt.Errorf("generate password hash: %w", err)
+		}
+		payload, err := json.Marshal(map[string]any{"instance_id": instanceID, "name": name, "username": username, "password_hash": passwordHash})
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO tasks(idempotency_key,task_type,resource_id,host_id,payload) VALUES ('reset-password:' || $1 || ':' || gen_random_uuid()::text,'RESET_INSTANCE_PASSWORD',$1::uuid,$2::uuid,$3)`, instanceID, hostID, payload); err != nil {
+			return nil, err
+		}
+		_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.reset_password','instance',$2,$3)`, actor, instanceID, []byte(`{"method":"qemu-guest-agent","secret_persisted":false}`))
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return map[string]any{"id": instanceID, "status": lifecycleStatus, "task_type": "RESET_INSTANCE_PASSWORD", "connection": map[string]any{"ip_address": ipAddress, "username": username, "password": password, "available_after_task": true}}, nil
 	}
 	if action == "retry" {
 		if lifecycleStatus != "ERROR" {
@@ -612,6 +647,8 @@ func (s *Service) applySuccessfulTask(ctx context.Context, tx pgx.Tx, taskType, 
 		}
 		_, err := tx.Exec(ctx, `DELETE FROM applications WHERE id=$1::uuid`, applicationID)
 		return err
+	case "RESET_INSTANCE_PASSWORD":
+		return nil
 	default:
 		return fmt.Errorf("unsupported successful task type %s", taskType)
 	}
@@ -625,6 +662,8 @@ func terminalFailureStatus(taskType string) string {
 		return "RUNNING"
 	case "DELETE_INSTANCE":
 		return "RETAINED"
+	case "RESET_INSTANCE_PASSWORD":
+		return "RUNNING"
 	default:
 		return "ERROR"
 	}

@@ -27,7 +27,7 @@
 - `POST /api/v1/applications`：提交虚拟机申请；成功时在 `connection` 中返回 IP、用户名和仅显示一次的初始密码。
 - `GET /api/v1/instances`：活动实例列表；已完成删除的实例不会返回。`scope=mine` 仅查询当前用户。默认排除 mock 节点的开发数据，诊断时可增加 `all=1`。
 - `GET /api/v1/instances/{id}`：实例配置、租期、任务历史和审计记录。
-- `POST /api/v1/instances/{id}/actions`：提交 `start`、`stop`、`reboot`、`retry`、`release` 或 `force_delete` 操作。普通释放保留磁盘和原 IP 7 天；`force_delete` 跳过保留期。删除任务成功后释放 IP 和宿主机配额，并清除实例、申请、任务与对应审计展示记录。`retry` 仅用于重试已达失败上限的创建任务。
+- `POST /api/v1/instances/{id}/actions`：提交 `start`、`stop`、`reboot`、`reset_password`、`retry`、`release` 或 `force_delete` 操作。`reset_password` 仅允许运行中实例，响应返回只显示一次的新密码，任务负载只保存密码摘要。普通释放保留磁盘和原 IP 7 天；`force_delete` 跳过保留期。删除任务成功后释放 IP 和宿主机配额，并清除实例、申请、任务与对应审计展示记录。`retry` 仅用于重试已达失败上限的创建任务。
 - `POST /api/v1/instances/{id}/renew`：按小时续期，允许 1-720 小时。
 
 ## Agent 接口
@@ -42,6 +42,8 @@
 `CREATE_INSTANCE` 任务包含实例 UUID、名称、CPU、内存、磁盘、`image_file`、网桥、稳定生成的 `mac_address`、IP、前缀长度、网关、DNS、用户名和 `password_hash`。密码摘要由 PostgreSQL `pgcrypto` 生成，明文不写入任务、实例表或审计日志。
 
 `START_INSTANCE`、`STOP_INSTANCE`、`REBOOT_INSTANCE` 和 `DELETE_INSTANCE` 只下发实例 UUID、域名和触发原因。到期实例会先关机并进入 7 天保留期；保留期结束后才下发删除任务、释放 IP 和宿主机配额。
+
+`RESET_INSTANCE_PASSWORD` 下发实例 UUID、域名、系统用户名和 crypt 密码摘要。明文新密码只存在于本次 HTTP 响应，不写入任务、实例表或审计日志。
 
 申请成功响应示例：
 
