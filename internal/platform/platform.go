@@ -62,6 +62,7 @@ type HostFacts struct {
 	TotalMemoryMB     int      `json:"total_memory_mb"`
 	AvailableMemoryMB int      `json:"available_memory_mb"`
 	StorageFreeGB     int      `json:"storage_free_gb"`
+	ConsoleURL        string   `json:"console_url,omitempty"`
 }
 
 type Domain struct {
@@ -632,11 +633,8 @@ func (s *Service) applySuccessfulTask(ctx context.Context, tx pgx.Tx, taskType, 
 		if _, err := tx.Exec(ctx, `UPDATE hosts SET reserved_cpu=greatest(0,reserved_cpu-$1),reserved_memory_mb=greatest(0,reserved_memory_mb-$2),reserved_disk_gb=greatest(0,reserved_disk_gb-$3),updated_at=now() WHERE id=$4::uuid`, cpu, memoryMB, diskGB, hostID); err != nil {
 			return err
 		}
-		// 宿主机确认删除成功后，同时清除控制面的实例展示、任务和审计记录。
+		// 宿主机确认删除成功后清除实例与任务，审计流水按合规要求继续保留。
 		if _, err := tx.Exec(ctx, `DELETE FROM discovered_instances WHERE platform_instance_id=$1::uuid`, resourceID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `DELETE FROM audit_logs WHERE (resource_type='instance' AND resource_id=$1) OR (resource_type='application' AND resource_id=$2)`, resourceID, applicationID); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM tasks WHERE resource_id=$1::uuid`, resourceID); err != nil {

@@ -23,6 +23,7 @@ type API struct {
 	SessionTTL            time.Duration
 	SessionSecure         bool
 	SettingsEncryptionKey []byte
+	ConsoleSigningKey     []byte
 	LDAP                  LDAPConfig
 }
 
@@ -68,7 +69,9 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/instances/{id}", a.instanceDetail)
 	mux.HandleFunc("POST /api/v1/instances/{id}/actions", a.instanceAction)
 	mux.HandleFunc("POST /api/v1/instances/{id}/renew", a.renewInstance)
+	mux.HandleFunc("POST /api/v1/instances/{id}/console-sessions", a.createConsoleSession)
 	mux.HandleFunc("GET /api/v1/tasks", a.tasks)
+	mux.HandleFunc("GET /api/v1/audit-logs", a.auditLogs)
 	mux.HandleFunc("POST /api/v1/agents/register", a.registerAgent)
 	mux.HandleFunc("POST /api/v1/agents/{id}/heartbeat", a.agentHeartbeat)
 	mux.HandleFunc("GET /api/v1/agents/{id}/tasks/next", a.agentTask)
@@ -76,7 +79,7 @@ func (a *API) Handler() http.Handler {
 	if a.SessionTTL <= 0 {
 		a.SessionTTL = 12 * time.Hour
 	}
-	return withMiddleware(a.authenticate(mux))
+	return withMiddleware(a.authenticate(a.auditMutation(mux)))
 }
 
 func withMiddleware(next http.Handler) http.Handler {

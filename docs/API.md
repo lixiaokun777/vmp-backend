@@ -29,6 +29,8 @@
 - `GET /api/v1/instances/{id}`：实例配置、租期、任务历史和审计记录。
 - `POST /api/v1/instances/{id}/actions`：提交 `start`、`stop`、`reboot`、`reset_password`、`retry`、`release` 或 `force_delete` 操作。`reset_password` 仅允许运行中实例，响应返回只显示一次的新密码，任务负载只保存密码摘要。普通释放保留磁盘和原 IP 7 天；`force_delete` 跳过保留期。删除任务成功后释放 IP 和宿主机配额，并清除实例、申请、任务与对应审计展示记录。`retry` 仅用于重试已达失败上限的创建任务。
 - `POST /api/v1/instances/{id}/renew`：按小时续期，允许 1-720 小时。
+- `POST /api/v1/instances/{id}/console-sessions`：请求 `mode=vnc|serial`，仅实例所有者或管理员可用。返回 Agent WebSocket 地址和 2 分钟有效票据，仅运行中实例可建立会话。
+- `GET /api/v1/audit-logs`：管理员查询平台操作流水，支持 `keyword`、`action`、`resource_type`、`outcome`、`from`、`to`、`page`和 `page_size`。
 
 ## Agent 接口
 
@@ -61,4 +63,4 @@
 }
 ```
 
-当前为内网第一版协议，已启用用户身份认证和角色授权。正式上线前还需通过 HTTPS 传输会话 Cookie，并定期轮换 Agent 令牌。
+当前为内网第一版协议，已启用用户身份认证和角色授权。正式上线前还需通过 HTTPS/WSS 传输会话，并定期轮换 Agent 令牌和控制台签名密钥。

@@ -38,6 +38,7 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 		Source   string `json:"source"`
 	}
 	if json.NewDecoder(r.Body).Decode(&input) != nil {
+		a.recordAudit(r.Context(), r, "anonymous", "auth.login", "session", "-", "FAILED", map[string]any{"reason": "invalid_json"})
 		writeError(w, 400, "登录信息格式无效")
 		return
 	}
@@ -47,10 +48,12 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 		input.Source = "LOCAL"
 	}
 	if input.Source != "LOCAL" && input.Source != "LDAP" {
+		a.recordAudit(r.Context(), r, input.Username, "auth.login", "session", input.Username, "FAILED", map[string]any{"source": input.Source, "reason": "invalid_source"})
 		writeError(w, 422, "登录类型无效")
 		return
 	}
 	if input.Username == "" || input.Password == "" {
+		a.recordAudit(r.Context(), r, input.Username, "auth.login", "session", input.Username, "FAILED", map[string]any{"source": input.Source, "reason": "missing_credentials"})
 		writeError(w, 422, "请输入用户名和密码")
 		return
 	}
@@ -60,15 +63,18 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 	var ldapDN string
 	err := a.Service.DB.QueryRow(r.Context(), `SELECT id::text,username,display_name,email,role,source,enabled,must_change_password,coalesce(ldap_dn,''),CASE WHEN source='LOCAL' THEN password_hash=crypt($2,password_hash) ELSE false END FROM users WHERE lower(username)=lower($1) AND source=$3`, input.Username, input.Password, input.Source).Scan(&user.ID, &user.Username, &user.DisplayName, &user.Email, &user.Role, &user.Source, &enabled, &user.MustChangePassword, &ldapDN, &passwordOK)
 	if err != nil || !enabled {
+		a.recordAudit(r.Context(), r, input.Username, "auth.login", "session", input.Username, "FAILED", map[string]any{"source": input.Source, "reason": "invalid_credentials_or_disabled"})
 		writeError(w, 401, "用户名或密码错误")
 		return
 	}
 	if user.Source == "LDAP" {
 		if err := a.authenticateLDAP(r.Context(), ldapDN, input.Password); err != nil {
+			a.recordAudit(r.Context(), r, input.Username, "auth.login", "session", input.Username, "FAILED", map[string]any{"source": input.Source, "reason": "invalid_credentials"})
 			writeError(w, 401, "用户名或密码错误")
 			return
 		}
 	} else if !passwordOK {
+		a.recordAudit(r.Context(), r, input.Username, "auth.login", "session", input.Username, "FAILED", map[string]any{"source": input.Source, "reason": "invalid_credentials"})
 		writeError(w, 401, "用户名或密码错误")
 		return
 	}
@@ -89,16 +95,19 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = a.Service.DB.Exec(r.Context(), `UPDATE users SET last_login_at=now(),updated_at=now() WHERE id=$1::uuid`, user.ID)
+	a.recordAudit(r.Context(), r, user.Username, "auth.login", "user", user.ID, "SUCCESS", map[string]any{"source": user.Source})
 	a.setSessionCookie(w, token, expiresAt)
 	writeJSON(w, 200, map[string]any{"user": user, "expires_at": expiresAt})
 }
 
 func (a *API) authLogout(w http.ResponseWriter, r *http.Request) {
+	user, _ := userFromRequest(r)
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {
 		hash := sha256.Sum256([]byte(cookie.Value))
 		_, _ = a.Service.DB.Exec(r.Context(), `DELETE FROM user_sessions WHERE token_hash=$1`, hash[:])
 	}
 	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", HttpOnly: true, Secure: a.SessionSecure, SameSite: http.SameSiteStrictMode, MaxAge: -1, Expires: time.Unix(0, 0)})
+	a.recordAudit(r.Context(), r, user.Username, "auth.logout", "user", user.ID, "SUCCESS", map[string]any{})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -142,6 +151,7 @@ func (a *API) changeOwnPassword(w http.ResponseWriter, r *http.Request) {
 		currentHash := sha256.Sum256([]byte(cookie.Value))
 		_, _ = a.Service.DB.Exec(r.Context(), `DELETE FROM user_sessions WHERE user_id=$1::uuid AND token_hash<>$2`, user.ID, currentHash[:])
 	}
+	a.recordAudit(r.Context(), r, user.Username, "auth.password.change", "user", user.ID, "SUCCESS", map[string]any{})
 	writeJSON(w, 200, map[string]any{"updated": true})
 }
 
@@ -198,6 +208,9 @@ func ordinaryUserRouteAllowed(r *http.Request) bool {
 			return true
 		}
 		if r.Method == http.MethodPost && len(parts) == 2 && parts[0] != "" && (parts[1] == "actions" || parts[1] == "renew") {
+			return true
+		}
+		if r.Method == http.MethodPost && len(parts) == 2 && parts[0] != "" && parts[1] == "console-sessions" {
 			return true
 		}
 	}

@@ -34,6 +34,7 @@ func main() {
 		SessionTTL:            time.Duration(envInt("SESSION_TTL_HOURS", 12)) * time.Hour,
 		SessionSecure:         envBool("SESSION_COOKIE_SECURE", false),
 		SettingsEncryptionKey: settingsEncryptionKey(os.Getenv("SETTINGS_ENCRYPTION_KEY")),
+		ConsoleSigningKey:     consoleSigningKey(os.Getenv("CONSOLE_SIGNING_KEY")),
 		LDAP: httpapi.LDAPConfig{
 			Active:          os.Getenv("LDAP_URL") != "",
 			URL:             os.Getenv("LDAP_URL"),
@@ -64,6 +65,14 @@ func main() {
 		slog.Error("server failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+func consoleSigningKey(secret string) []byte {
+	if secret == "" {
+		return nil
+	}
+	hash := sha256.Sum256([]byte(secret))
+	return hash[:]
 }
 
 func settingsEncryptionKey(secret string) []byte {
