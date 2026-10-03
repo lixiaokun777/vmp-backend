@@ -28,10 +28,13 @@
 - `GET /api/v1/instances`：活动实例列表；已完成删除的实例不会返回。`scope=mine` 仅查询当前用户。默认排除 mock 节点的开发数据，诊断时可增加 `all=1`。
 - `GET /api/v1/instances/{id}`：实例配置、租期、任务历史和审计记录。
 - `POST /api/v1/instances/{id}/actions`：提交 `start`、`stop`、`reboot`、`reset_password`、`retry`、`release` 或 `force_delete` 操作。`reset_password` 仅允许运行中实例，响应返回只显示一次的新密码，任务负载只保存密码摘要。普通释放保留磁盘和原 IP 7 天；`force_delete` 跳过保留期。删除任务成功后释放 IP 和宿主机配额，并清除实例、申请、任务与对应审计展示记录。`retry` 仅用于重试已达失败上限的创建任务。
-- `POST /api/v1/instances/{id}/renew`：按小时续期，允许 1-720 小时；超过 168 小时进入审批。
-- `POST /api/v1/instances/{id}/restore`：恢复仍在 7 天保留期内的实例，复用原磁盘和原 IP；恢复租期超过 168 小时进入审批。
+- `POST /api/v1/instances/{id}/renew`：按小时续期，允许 1-720 小时并必须填写 `reason`；超过 168 小时进入审批。
+- `POST /api/v1/instances/{id}/restore`：恢复仍在 7 天保留期内的实例，必须填写 `reason`；复用原磁盘和原 IP且每台实例最多恢复一次，恢复租期超过 168 小时进入审批。
 - `GET /api/v1/approvals`：普通用户只能查看自己的审批单；管理员查看全部审批单，可用 `status` 筛选，`scope=mine` 查看本人提交。
-- `POST /api/v1/approvals/{id}/decision`：管理员批准或拒绝审批，`decision=APPROVE|REJECT`；拒绝必须填写 `comment`。批准后才执行创建、续期或恢复。
+- `POST /api/v1/approvals/{id}/decision`：管理员批准或拒绝审批，`decision=APPROVE|REJECT`；拒绝必须填写 `comment`，批准可用 `adjusted_hours` 调整租期。接口只处理仍为待审批且未超时的记录，避免重复批准。
+- `POST /api/v1/approvals/batch-decision`：管理员批量批准或拒绝最多 50 个审批单，逐条返回执行结果。
+- `POST /api/v1/approvals/{id}/withdraw`：申请人撤回仍为待审批的申请。
+- `POST /api/v1/approvals/{id}/resubmit-short`：被拒绝、超时或执行失败后，申请人改为不超过 168 小时的短租期并立即执行。
 - `POST /api/v1/instances/{id}/console-sessions`：请求 `mode=vnc|serial`，仅实例所有者或管理员可用。返回 Agent WebSocket 地址和 5 分钟有效的一次性票据，仅运行中实例可建立会话。
 - `POST /api/v1/agents/{id}/console-sessions/{sessionID}/consume`：Agent 使用运行令牌原子核销一次性票据，仅供内部调用。
 - `GET /api/v1/audit-logs`：管理员查询平台操作流水，支持 `keyword`、`action`、`resource_type`、`outcome`、`scope`、`from`、`to`、`page`和 `page_size`，并返回动态动作与资源类型选项。

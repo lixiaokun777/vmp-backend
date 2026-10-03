@@ -365,8 +365,9 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 	}
 	defer tx.Rollback(ctx)
 	var owner, hostID, name, username, ipAddress, lifecycleStatus string
+	var restoreCount int
 	var expiresAt time.Time
-	err = tx.QueryRow(ctx, `SELECT a.applicant,i.host_id::text,i.name,coalesce(i.username,''),coalesce(host(i.ip_address),''),i.lifecycle_status,i.expires_at FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &hostID, &name, &username, &ipAddress, &lifecycleStatus, &expiresAt)
+	err = tx.QueryRow(ctx, `SELECT a.applicant,i.host_id::text,i.name,coalesce(i.username,''),coalesce(host(i.ip_address),''),i.lifecycle_status,i.expires_at,i.restore_count FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &hostID, &name, &username, &ipAddress, &lifecycleStatus, &expiresAt, &restoreCount)
 	if err != nil {
 		return nil, err
 	}
@@ -430,6 +431,22 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 		return map[string]any{"id": instanceID, "status": "PROVISIONING", "task_type": "CREATE_INSTANCE"}, nil
 	}
 	if action == "release" {
+		if restoreCount >= 1 {
+			if lifecycleStatus != "RUNNING" && lifecycleStatus != "STOPPED" {
+				return nil, fmt.Errorf("instance cannot be released from status %s", lifecycleStatus)
+			}
+			if err := insertInstanceTask(ctx, tx, "DELETE_INSTANCE", instanceID, hostID, name, "release-after-restore"); err != nil {
+				return nil, err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='DELETING',retention_until=now(),updated_at=now() WHERE id=$1::uuid`, instanceID); err != nil {
+				return nil, err
+			}
+			_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.release','instance',$2,'{"retention_days":0,"reason":"restore_limit_reached"}'::jsonb)`, actor, instanceID)
+			if err := tx.Commit(ctx); err != nil {
+				return nil, err
+			}
+			return map[string]any{"id": instanceID, "status": "DELETING", "retention_days": 0, "task_type": "DELETE_INSTANCE"}, nil
+		}
 		switch lifecycleStatus {
 		case "RUNNING":
 			if err := insertInstanceTask(ctx, tx, "STOP_INSTANCE", instanceID, hostID, name, "manual-release"); err != nil {
@@ -503,7 +520,7 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 	return map[string]any{"id": instanceID, "status": spec.PendingState, "task_type": spec.TaskType}, nil
 }
 
-func (s *Service) renewInstanceNow(ctx context.Context, actor string, administrator bool, instanceID string, hours int) (map[string]any, error) {
+func (s *Service) renewInstanceNow(ctx context.Context, actor string, administrator bool, instanceID string, hours int, reason string) (map[string]any, error) {
 	if !uuidPattern.MatchString(instanceID) || hours < 1 || hours > 720 {
 		return nil, errors.New("instance id or renewal hours is invalid")
 	}
@@ -531,7 +548,7 @@ func (s *Service) renewInstanceNow(ctx context.Context, actor string, administra
 	if err != nil {
 		return nil, err
 	}
-	detail, _ := json.Marshal(map[string]any{"hours": hours, "expires_at": expiresAt})
+	detail, _ := json.Marshal(map[string]any{"hours": hours, "reason": reason, "expires_at": expiresAt})
 	_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.renew','instance',$2,$3)`, actor, instanceID, detail)
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -590,10 +607,20 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 		if err == nil {
 			err = s.applySuccessfulTask(ctx, tx, taskType, resourceID, result)
 		}
+		if err == nil && (taskType == "CREATE_INSTANCE" || taskType == "START_INSTANCE") {
+			_, err = tx.Exec(ctx, `UPDATE approval_requests SET status='APPROVED',result=result-'error',updated_at=now() WHERE instance_id=$1::uuid AND status='APPROVED_FAILED' AND ((request_type='CREATE' AND $2='CREATE_INSTANCE') OR (request_type='RESTORE' AND $2='START_INSTANCE'))`, resourceID, taskType)
+		}
 	} else {
 		_, err = tx.Exec(ctx, `UPDATE tasks SET status=CASE WHEN attempt>=max_attempts THEN 'FAILED' ELSE 'PENDING' END,error_message=$1,available_at=now()+interval '15 seconds',completed_at=CASE WHEN attempt>=max_attempts THEN now() ELSE NULL END,updated_at=now() WHERE id=$2::uuid`, result.Error, taskID)
 		if err == nil && attempt >= maxAttempts {
-			_, _ = tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,updated_at=now() WHERE id=$2::uuid`, terminalFailureStatus(taskType), resourceID)
+			if _, err = tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,updated_at=now() WHERE id=$2::uuid`, terminalFailureStatus(taskType), resourceID); err != nil {
+				return err
+			}
+			if taskType == "CREATE_INSTANCE" || taskType == "START_INSTANCE" {
+				if _, err = tx.Exec(ctx, `UPDATE approval_requests SET status='APPROVED_FAILED',result=result||jsonb_build_object('error',$1::text),updated_at=now() WHERE instance_id=$2::uuid AND status='APPROVED' AND ((request_type='CREATE' AND $3='CREATE_INSTANCE') OR (request_type='RESTORE' AND $3='START_INSTANCE'))`, result.Error, resourceID, taskType); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	if err != nil {
@@ -716,6 +743,9 @@ func StartReconciler(ctx context.Context, service *Service) {
 			return
 		case <-ticker.C:
 			service.MarkOfflineHosts(ctx)
+			if err := service.ExpirePendingApprovals(ctx); err != nil {
+				fmt.Printf("expire pending approvals: %v\n", err)
+			}
 			if err := service.ReconcileInstanceLifecycle(ctx); err != nil {
 				fmt.Printf("reconcile instance lifecycle: %v\n", err)
 			}

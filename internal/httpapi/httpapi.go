@@ -73,7 +73,10 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/instances/{id}/restore", a.restoreInstance)
 	mux.HandleFunc("POST /api/v1/instances/{id}/console-sessions", a.createConsoleSession)
 	mux.HandleFunc("GET /api/v1/approvals", a.approvals)
+	mux.HandleFunc("POST /api/v1/approvals/{id}/withdraw", a.withdrawApproval)
+	mux.HandleFunc("POST /api/v1/approvals/{id}/resubmit-short", a.resubmitApprovalShort)
 	mux.HandleFunc("POST /api/v1/approvals/{id}/decision", a.decideApproval)
+	mux.HandleFunc("POST /api/v1/approvals/batch-decision", a.batchDecideApprovals)
 	mux.HandleFunc("GET /api/v1/tasks", a.tasks)
 	mux.HandleFunc("GET /api/v1/audit-logs", a.auditLogs)
 	mux.HandleFunc("POST /api/v1/agents/register", a.registerAgent)
@@ -112,13 +115,14 @@ func (a *API) summary(w http.ResponseWriter, r *http.Request) {
 		(SELECT count(*) FROM instances i JOIN hosts h ON h.id=i.host_id WHERE i.lifecycle_status='PROVISIONING' AND h.agent_mode<>'mock'),
 		(SELECT count(*) FROM applications a JOIN instances i ON i.application_id=a.id JOIN hosts h ON h.id=i.host_id WHERE h.agent_mode<>'mock'),
 		coalesce((SELECT sum(reserved_memory_mb) FROM hosts WHERE status='ACTIVE' AND agent_mode<>'mock'),0),
-		coalesce((SELECT sum(allocatable_memory_mb) FROM hosts WHERE status='ACTIVE' AND agent_mode<>'mock'),0)`)
-	var h, running, provisioning, apps, usedMem, totalMem int
-	if err := row.Scan(&h, &running, &provisioning, &apps, &usedMem, &totalMem); err != nil {
+		coalesce((SELECT sum(allocatable_memory_mb) FROM hosts WHERE status='ACTIVE' AND agent_mode<>'mock'),0),
+		(SELECT count(*) FROM approval_requests WHERE status='PENDING' AND expires_at>now())`)
+	var h, running, provisioning, apps, usedMem, totalMem, pendingApprovals int
+	if err := row.Scan(&h, &running, &provisioning, &apps, &usedMem, &totalMem, &pendingApprovals); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"active_hosts": h, "running_instances": running, "provisioning_instances": provisioning, "applications": apps, "reserved_memory_mb": usedMem, "allocatable_memory_mb": totalMem})
+	writeJSON(w, 200, map[string]any{"active_hosts": h, "running_instances": running, "provisioning_instances": provisioning, "applications": apps, "reserved_memory_mb": usedMem, "allocatable_memory_mb": totalMem, "pending_approvals": pendingApprovals})
 }
 
 func (a *API) hosts(w http.ResponseWriter, r *http.Request) {
@@ -163,13 +167,13 @@ func (a *API) instances(w http.ResponseWriter, r *http.Request) {
 		args = append(args, user.Username)
 	}
 	where := " WHERE " + strings.Join(filters, " AND ")
-	a.queryListArgs(w, r, `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'host',h.name,'flavor',f.name,'image',im.name,'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'created_at',i.created_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id`+where+` ORDER BY i.created_at DESC`, args...)
+	a.queryListArgs(w, r, `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'host',h.name,'flavor',f.name,'image',im.name,'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'restore_count',i.restore_count,'created_at',i.created_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id`+where+` ORDER BY i.created_at DESC`, args...)
 }
 
 func (a *API) instanceDetail(w http.ResponseWriter, r *http.Request) {
 	user, _ := userFromRequest(r)
 	var instance json.RawMessage
-	err := a.Service.DB.QueryRow(r.Context(), `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'purpose',a.purpose,'request_no',a.request_no,'host',h.name,'host_id',i.host_id,'flavor',jsonb_build_object('id',f.id,'name',f.name,'cpu',f.cpu,'memory_mb',f.memory_mb,'disk_gb',f.disk_gb),'image',jsonb_build_object('id',im.id,'name',im.name,'source_type',im.source_type,'source_location',im.source_location,'sync_status',im.sync_status),'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'provider_ref',i.provider_ref,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'created_at',i.created_at,'updated_at',i.updated_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id WHERE i.id=$1::uuid AND ($3 OR a.applicant=$2)`, r.PathValue("id"), user.Username, user.Role == "ADMIN").Scan(&instance)
+	err := a.Service.DB.QueryRow(r.Context(), `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'purpose',a.purpose,'request_no',a.request_no,'host',h.name,'host_id',i.host_id,'flavor',jsonb_build_object('id',f.id,'name',f.name,'cpu',f.cpu,'memory_mb',f.memory_mb,'disk_gb',f.disk_gb),'image',jsonb_build_object('id',im.id,'name',im.name,'source_type',im.source_type,'source_location',im.source_location,'sync_status',im.sync_status),'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'provider_ref',i.provider_ref,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'restore_count',i.restore_count,'created_at',i.created_at,'updated_at',i.updated_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id WHERE i.id=$1::uuid AND ($3 OR a.applicant=$2)`, r.PathValue("id"), user.Username, user.Role == "ADMIN").Scan(&instance)
 	if err != nil {
 		writeError(w, 404, "instance not found")
 		return
@@ -877,14 +881,15 @@ func (a *API) instanceAction(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) renewInstance(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Hours int `json:"hours"`
+		Hours  int    `json:"hours"`
+		Reason string `json:"reason"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeError(w, 400, "invalid JSON")
 		return
 	}
 	user, _ := userFromRequest(r)
-	result, err := a.Service.RenewInstance(r.Context(), user.Username, user.Role == "ADMIN", r.PathValue("id"), in.Hours)
+	result, err := a.Service.RenewInstance(r.Context(), user.Username, user.Role == "ADMIN", r.PathValue("id"), in.Hours, in.Reason)
 	if err != nil {
 		writeError(w, 422, err.Error())
 		return
@@ -894,14 +899,15 @@ func (a *API) renewInstance(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) restoreInstance(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Hours int `json:"hours"`
+		Hours  int    `json:"hours"`
+		Reason string `json:"reason"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeError(w, 400, "invalid JSON")
 		return
 	}
 	user, _ := userFromRequest(r)
-	result, err := a.Service.RestoreInstance(r.Context(), user.Username, user.Role == "ADMIN", r.PathValue("id"), in.Hours)
+	result, err := a.Service.RestoreInstance(r.Context(), user.Username, user.Role == "ADMIN", r.PathValue("id"), in.Hours, in.Reason)
 	if err != nil {
 		writeError(w, 422, err.Error())
 		return
@@ -921,26 +927,77 @@ func (a *API) approvals(w http.ResponseWriter, r *http.Request) {
 		args = append(args, requestedStatus)
 		conditions = append(conditions, "ar.status=$"+strconv.Itoa(len(args)))
 	}
-	query := `SELECT jsonb_build_object('id',ar.id,'request_no',ar.request_no,'request_type',ar.request_type,'applicant',ar.applicant,'instance_id',ar.instance_id,'instance_name',coalesce(i.name,ar.payload->>'instance_name','-'),'requested_hours',ar.requested_hours,'reason',ar.reason,'status',ar.status,'reviewer',ar.reviewer,'review_comment',ar.review_comment,'result',ar.result,'created_at',ar.created_at,'reviewed_at',ar.reviewed_at) FROM approval_requests ar LEFT JOIN instances i ON i.id=ar.instance_id WHERE ` + strings.Join(conditions, " AND ") + ` ORDER BY CASE ar.status WHEN 'PENDING' THEN 0 WHEN 'PROCESSING' THEN 1 ELSE 2 END,ar.created_at DESC`
+	query := `SELECT jsonb_build_object('id',ar.id,'request_no',ar.request_no,'request_type',ar.request_type,'applicant',ar.applicant,'instance_id',ar.instance_id,'instance_name',coalesce(i.name,ar.payload->>'instance_name','-'),'requested_hours',ar.requested_hours,'reason',ar.reason,'status',ar.status,'reviewer',ar.reviewer,'review_comment',ar.review_comment,'result',ar.result,'created_at',ar.created_at,'expires_at',ar.expires_at,'reviewed_at',ar.reviewed_at) FROM approval_requests ar LEFT JOIN instances i ON i.id=ar.instance_id WHERE ` + strings.Join(conditions, " AND ") + ` ORDER BY CASE ar.status WHEN 'PENDING' THEN 0 WHEN 'PROCESSING' THEN 1 ELSE 2 END,ar.created_at DESC`
 	a.queryListArgs(w, r, query, args...)
 }
 
 func (a *API) decideApproval(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Decision string `json:"decision"`
-		Comment  string `json:"comment"`
+		Decision      string `json:"decision"`
+		Comment       string `json:"comment"`
+		AdjustedHours int    `json:"adjusted_hours"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeError(w, 400, "invalid JSON")
 		return
 	}
 	user, _ := userFromRequest(r)
-	result, err := a.Service.DecideApproval(r.Context(), user.Username, r.PathValue("id"), in.Decision, in.Comment)
+	result, err := a.Service.DecideApproval(r.Context(), user.Username, r.PathValue("id"), in.Decision, in.Comment, in.AdjustedHours)
 	if err != nil {
 		writeError(w, 422, err.Error())
 		return
 	}
 	writeJSON(w, 200, result)
+}
+
+func (a *API) withdrawApproval(w http.ResponseWriter, r *http.Request) {
+	user, _ := userFromRequest(r)
+	if err := a.Service.WithdrawApproval(r.Context(), user.Username, r.PathValue("id")); err != nil {
+		writeError(w, 422, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"id": r.PathValue("id"), "status": "WITHDRAWN"})
+}
+
+func (a *API) resubmitApprovalShort(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Hours  int    `json:"hours"`
+		Reason string `json:"reason"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	user, _ := userFromRequest(r)
+	result, err := a.Service.ResubmitApprovalShort(r.Context(), user.Username, user.Role == "ADMIN", r.PathValue("id"), in.Hours, in.Reason)
+	if err != nil {
+		writeError(w, 422, err.Error())
+		return
+	}
+	writeJSON(w, 200, result)
+}
+
+func (a *API) batchDecideApprovals(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		IDs      []string `json:"ids"`
+		Decision string   `json:"decision"`
+		Comment  string   `json:"comment"`
+	}
+	if json.NewDecoder(r.Body).Decode(&in) != nil || len(in.IDs) == 0 || len(in.IDs) > 50 {
+		writeError(w, 422, "请选择 1-50 个审批单")
+		return
+	}
+	user, _ := userFromRequest(r)
+	items := make([]map[string]any, 0, len(in.IDs))
+	for _, id := range in.IDs {
+		result, err := a.Service.DecideApproval(r.Context(), user.Username, id, in.Decision, in.Comment, 0)
+		if err != nil {
+			items = append(items, map[string]any{"id": id, "success": false, "error": err.Error()})
+		} else {
+			items = append(items, map[string]any{"id": id, "success": true, "result": result})
+		}
+	}
+	writeJSON(w, 200, map[string]any{"items": items})
 }
 
 func (a *API) registerAgent(w http.ResponseWriter, r *http.Request) {

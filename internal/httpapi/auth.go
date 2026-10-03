@@ -202,6 +202,12 @@ func ordinaryUserRouteAllowed(r *http.Request) bool {
 	if path == "/api/v1/applications" && r.Method == http.MethodPost {
 		return true
 	}
+	if strings.HasPrefix(path, "/api/v1/approvals/") && r.Method == http.MethodPost {
+		parts := strings.Split(strings.TrimPrefix(path, "/api/v1/approvals/"), "/")
+		if len(parts) == 2 && parts[0] != "" && (parts[1] == "withdraw" || parts[1] == "resubmit-short") {
+			return true
+		}
+	}
 	if strings.HasPrefix(path, "/api/v1/instances/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/api/v1/instances/"), "/")
 		if r.Method == http.MethodGet && len(parts) == 1 && parts[0] != "" {
