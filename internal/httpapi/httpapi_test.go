@@ -63,6 +63,8 @@ func TestOrdinaryUserRoutePolicy(t *testing.T) {
 		httptest.NewRequest("GET", "/api/v1/instances/00000000-0000-0000-0000-000000000000", nil),
 		httptest.NewRequest("POST", "/api/v1/instances/00000000-0000-0000-0000-000000000000/actions", nil),
 		httptest.NewRequest("POST", "/api/v1/instances/00000000-0000-0000-0000-000000000000/renew", nil),
+		httptest.NewRequest("POST", "/api/v1/instances/00000000-0000-0000-0000-000000000000/restore", nil),
+		httptest.NewRequest("GET", "/api/v1/approvals?scope=mine", nil),
 	}
 	for _, request := range allowed {
 		if !ordinaryUserRouteAllowed(request) {
@@ -75,6 +77,7 @@ func TestOrdinaryUserRoutePolicy(t *testing.T) {
 		httptest.NewRequest("GET", "/api/v1/users", nil),
 		httptest.NewRequest("POST", "/api/v1/networks", nil),
 		httptest.NewRequest("POST", "/api/v1/instances/00000000-0000-0000-0000-000000000000/admin-operation", nil),
+		httptest.NewRequest("POST", "/api/v1/approvals/00000000-0000-0000-0000-000000000000/decision", nil),
 	}
 	for _, request := range denied {
 		if ordinaryUserRouteAllowed(request) {

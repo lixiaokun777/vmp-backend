@@ -101,7 +101,7 @@ func New(ctx context.Context, databaseURL string) (*Service, error) {
 	return &Service{DB: db}, nil
 }
 
-func (s *Service) CreateApplication(ctx context.Context, actor string, in CreateApplicationInput) (map[string]any, error) {
+func (s *Service) createApplicationNow(ctx context.Context, actor string, in CreateApplicationInput) (map[string]any, error) {
 	if in.InstanceName == "" || in.Purpose == "" || in.FlavorID == "" || in.ImageID == "" {
 		return nil, errors.New("instance_name, purpose, flavor_id and image_id are required")
 	}
@@ -503,7 +503,7 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 	return map[string]any{"id": instanceID, "status": spec.PendingState, "task_type": spec.TaskType}, nil
 }
 
-func (s *Service) RenewInstance(ctx context.Context, actor string, administrator bool, instanceID string, hours int) (map[string]any, error) {
+func (s *Service) renewInstanceNow(ctx context.Context, actor string, administrator bool, instanceID string, hours int) (map[string]any, error) {
 	if !uuidPattern.MatchString(instanceID) || hours < 1 || hours > 720 {
 		return nil, errors.New("instance id or renewal hours is invalid")
 	}
@@ -512,27 +512,22 @@ func (s *Service) RenewInstance(ctx context.Context, actor string, administrator
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	var owner, hostID, name, lifecycleStatus string
-	var retained bool
-	err = tx.QueryRow(ctx, `SELECT a.applicant,i.host_id::text,i.name,i.lifecycle_status,i.retention_until IS NOT NULL FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &hostID, &name, &lifecycleStatus, &retained)
+	var owner, lifecycleStatus string
+	err = tx.QueryRow(ctx, `SELECT a.applicant,i.lifecycle_status FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &lifecycleStatus)
 	if err != nil {
 		return nil, err
 	}
 	if owner != actor && !administrator {
 		return nil, errors.New("instance does not belong to the current user")
 	}
-	if lifecycleStatus == "DELETING" || lifecycleStatus == "RELEASED" || lifecycleStatus == "PROVISIONING" {
+	if lifecycleStatus == "RETAINED" {
+		return nil, errors.New("保留期实例请使用恢复操作")
+	}
+	if lifecycleStatus != "RUNNING" && lifecycleStatus != "STOPPED" {
 		return nil, fmt.Errorf("instance cannot be renewed from status %s", lifecycleStatus)
 	}
-	nextStatus := lifecycleStatus
-	if retained && (lifecycleStatus == "RETAINED" || lifecycleStatus == "STOPPED") {
-		if err := insertInstanceTask(ctx, tx, "START_INSTANCE", instanceID, hostID, name, "renewal"); err != nil {
-			return nil, err
-		}
-		nextStatus = "STARTING"
-	}
 	var expiresAt time.Time
-	err = tx.QueryRow(ctx, `UPDATE instances SET expires_at=greatest(expires_at,now())+make_interval(hours=>$1),retention_until=NULL,lifecycle_status=$2,updated_at=now() WHERE id=$3::uuid RETURNING expires_at`, hours, nextStatus, instanceID).Scan(&expiresAt)
+	err = tx.QueryRow(ctx, `UPDATE instances SET expires_at=greatest(expires_at,now())+make_interval(hours=>$1),updated_at=now() WHERE id=$2::uuid RETURNING expires_at`, hours, instanceID).Scan(&expiresAt)
 	if err != nil {
 		return nil, err
 	}
@@ -541,7 +536,7 @@ func (s *Service) RenewInstance(ctx context.Context, actor string, administrator
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return map[string]any{"id": instanceID, "status": nextStatus, "expires_at": expiresAt}, nil
+	return map[string]any{"id": instanceID, "status": lifecycleStatus, "expires_at": expiresAt}, nil
 }
 
 func insertInstanceTask(ctx context.Context, tx pgx.Tx, taskType, instanceID, hostID, name, reason string) error {

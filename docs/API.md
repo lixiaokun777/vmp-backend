@@ -10,7 +10,7 @@
 - `GET /api/v1/ldap/status`、`PUT /api/v1/ldap/config`：管理员查看并保存 LDAP 配置，响应不返回绑定密码。
 - `POST /api/v1/ldap/test`、`POST /api/v1/ldap/sync`：管理员测试目录连接并同步用户。
 
-除健康检查、登录和 Agent 通信外，所有接口均要求有效会话。管理员可访问全部平台管理接口；普通用户只可读取申请所需的规格、镜像和网络，提交申请，并查看、续期或操作自己的实例。服务端不信任客户端传入的用户名。
+除健康检查、登录和 Agent 通信外，所有接口均要求有效会话。管理员可访问全部平台管理接口；普通用户只可读取申请所需的规格、镜像和网络，提交申请，查看自己的审批单，并查看、续期、恢复或操作自己的实例。服务端不信任客户端传入的用户名。
 
 ## 业务接口
 
@@ -24,11 +24,14 @@
 - `GET/POST/PATCH/DELETE /api/v1/networks`：管理员同时定义网段、网关、DNS、Bridge 和唯一有效的 `ip_range_start` / `ip_range_end`。修改范围会事务性替换旧的空闲地址池；新范围之外存在已分配、预留或隔离地址时拒绝修改。仍有非空闲 IP 的网络不能删除。
 - `POST/DELETE /api/v1/networks/{id}/ip-ranges`：兼容旧客户端的地址池增删接口；Web 管理端统一通过网络编辑接口维护唯一范围。
 - `GET /api/v1/ip-addresses`：查询 IP 资源池。
-- `POST /api/v1/applications`：提交虚拟机申请；成功时在 `connection` 中返回 IP、用户名和仅显示一次的初始密码。
+- `POST /api/v1/applications`：提交虚拟机申请。租期不超过 168 小时自动调度，并在 `connection` 中返回 IP、用户名和仅显示一次的初始密码；超过 168 小时返回 `approval_required=true`，批准前不预占资源。
 - `GET /api/v1/instances`：活动实例列表；已完成删除的实例不会返回。`scope=mine` 仅查询当前用户。默认排除 mock 节点的开发数据，诊断时可增加 `all=1`。
 - `GET /api/v1/instances/{id}`：实例配置、租期、任务历史和审计记录。
 - `POST /api/v1/instances/{id}/actions`：提交 `start`、`stop`、`reboot`、`reset_password`、`retry`、`release` 或 `force_delete` 操作。`reset_password` 仅允许运行中实例，响应返回只显示一次的新密码，任务负载只保存密码摘要。普通释放保留磁盘和原 IP 7 天；`force_delete` 跳过保留期。删除任务成功后释放 IP 和宿主机配额，并清除实例、申请、任务与对应审计展示记录。`retry` 仅用于重试已达失败上限的创建任务。
-- `POST /api/v1/instances/{id}/renew`：按小时续期，允许 1-720 小时。
+- `POST /api/v1/instances/{id}/renew`：按小时续期，允许 1-720 小时；超过 168 小时进入审批。
+- `POST /api/v1/instances/{id}/restore`：恢复仍在 7 天保留期内的实例，复用原磁盘和原 IP；恢复租期超过 168 小时进入审批。
+- `GET /api/v1/approvals`：普通用户只能查看自己的审批单；管理员查看全部审批单，可用 `status` 筛选，`scope=mine` 查看本人提交。
+- `POST /api/v1/approvals/{id}/decision`：管理员批准或拒绝审批，`decision=APPROVE|REJECT`；拒绝必须填写 `comment`。批准后才执行创建、续期或恢复。
 - `POST /api/v1/instances/{id}/console-sessions`：请求 `mode=vnc|serial`，仅实例所有者或管理员可用。返回 Agent WebSocket 地址和 5 分钟有效的一次性票据，仅运行中实例可建立会话。
 - `POST /api/v1/agents/{id}/console-sessions/{sessionID}/consume`：Agent 使用运行令牌原子核销一次性票据，仅供内部调用。
 - `GET /api/v1/audit-logs`：管理员查询平台操作流水，支持 `keyword`、`action`、`resource_type`、`outcome`、`scope`、`from`、`to`、`page`和 `page_size`，并返回动态动作与资源类型选项。

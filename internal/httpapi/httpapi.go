@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -69,7 +70,10 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/instances/{id}", a.instanceDetail)
 	mux.HandleFunc("POST /api/v1/instances/{id}/actions", a.instanceAction)
 	mux.HandleFunc("POST /api/v1/instances/{id}/renew", a.renewInstance)
+	mux.HandleFunc("POST /api/v1/instances/{id}/restore", a.restoreInstance)
 	mux.HandleFunc("POST /api/v1/instances/{id}/console-sessions", a.createConsoleSession)
+	mux.HandleFunc("GET /api/v1/approvals", a.approvals)
+	mux.HandleFunc("POST /api/v1/approvals/{id}/decision", a.decideApproval)
 	mux.HandleFunc("GET /api/v1/tasks", a.tasks)
 	mux.HandleFunc("GET /api/v1/audit-logs", a.auditLogs)
 	mux.HandleFunc("POST /api/v1/agents/register", a.registerAgent)
@@ -881,6 +885,57 @@ func (a *API) renewInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	user, _ := userFromRequest(r)
 	result, err := a.Service.RenewInstance(r.Context(), user.Username, user.Role == "ADMIN", r.PathValue("id"), in.Hours)
+	if err != nil {
+		writeError(w, 422, err.Error())
+		return
+	}
+	writeJSON(w, 200, result)
+}
+
+func (a *API) restoreInstance(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Hours int `json:"hours"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	user, _ := userFromRequest(r)
+	result, err := a.Service.RestoreInstance(r.Context(), user.Username, user.Role == "ADMIN", r.PathValue("id"), in.Hours)
+	if err != nil {
+		writeError(w, 422, err.Error())
+		return
+	}
+	writeJSON(w, 200, result)
+}
+
+func (a *API) approvals(w http.ResponseWriter, r *http.Request) {
+	user, _ := userFromRequest(r)
+	conditions := []string{"true"}
+	args := make([]any, 0)
+	if user.Role != "ADMIN" || r.URL.Query().Get("scope") == "mine" {
+		args = append(args, user.Username)
+		conditions = append(conditions, "ar.applicant=$1")
+	}
+	if requestedStatus := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("status"))); requestedStatus != "" {
+		args = append(args, requestedStatus)
+		conditions = append(conditions, "ar.status=$"+strconv.Itoa(len(args)))
+	}
+	query := `SELECT jsonb_build_object('id',ar.id,'request_no',ar.request_no,'request_type',ar.request_type,'applicant',ar.applicant,'instance_id',ar.instance_id,'instance_name',coalesce(i.name,ar.payload->>'instance_name','-'),'requested_hours',ar.requested_hours,'reason',ar.reason,'status',ar.status,'reviewer',ar.reviewer,'review_comment',ar.review_comment,'result',ar.result,'created_at',ar.created_at,'reviewed_at',ar.reviewed_at) FROM approval_requests ar LEFT JOIN instances i ON i.id=ar.instance_id WHERE ` + strings.Join(conditions, " AND ") + ` ORDER BY CASE ar.status WHEN 'PENDING' THEN 0 WHEN 'PROCESSING' THEN 1 ELSE 2 END,ar.created_at DESC`
+	a.queryListArgs(w, r, query, args...)
+}
+
+func (a *API) decideApproval(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Decision string `json:"decision"`
+		Comment  string `json:"comment"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, 400, "invalid JSON")
+		return
+	}
+	user, _ := userFromRequest(r)
+	result, err := a.Service.DecideApproval(r.Context(), user.Username, r.PathValue("id"), in.Decision, in.Comment)
 	if err != nil {
 		writeError(w, 422, err.Error())
 		return
