@@ -74,6 +74,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/audit-logs", a.auditLogs)
 	mux.HandleFunc("POST /api/v1/agents/register", a.registerAgent)
 	mux.HandleFunc("POST /api/v1/agents/{id}/heartbeat", a.agentHeartbeat)
+	mux.HandleFunc("POST /api/v1/agents/{id}/console-sessions/{sessionID}/consume", a.consumeConsoleSession)
 	mux.HandleFunc("GET /api/v1/agents/{id}/tasks/next", a.agentTask)
 	mux.HandleFunc("POST /api/v1/agents/{id}/tasks/{taskID}/result", a.agentTaskResult)
 	if a.SessionTTL <= 0 {

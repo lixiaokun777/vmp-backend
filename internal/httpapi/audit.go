@@ -149,6 +149,21 @@ func (a *API) auditLogs(w http.ResponseWriter, r *http.Request) {
 	if outcome := strings.TrimSpace(query.Get("outcome")); outcome != "" {
 		add("outcome=$%d", outcome)
 	}
+	// 默认只展示人工操作；系统事件保留在同一存储中，但需显式切换查看。
+	scope := strings.ToUpper(strings.TrimSpace(query.Get("scope")))
+	if scope == "" {
+		scope = "HUMAN"
+	}
+	switch scope {
+	case "HUMAN":
+		conditions = append(conditions, "lower(actor) <> ALL(ARRAY['system','scheduler','agent'])")
+	case "SYSTEM":
+		conditions = append(conditions, "lower(actor) = ANY(ARRAY['system','scheduler','agent'])")
+	case "ALL":
+	default:
+		writeError(w, 422, "scope 参数无效")
+		return
+	}
 	for _, item := range []struct{ key, operator string }{{"from", ">="}, {"to", "<="}} {
 		if value := strings.TrimSpace(query.Get(item.key)); value != "" {
 			parsed, err := time.Parse(time.RFC3339, value)
@@ -171,5 +186,32 @@ func (a *API) auditLogs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"items": rows, "page": page, "page_size": pageSize, "total": total})
+	// 筛选项由真实审计数据生成，新增动作后前端无需同步硬编码。
+	actionRows, err := a.Service.DB.Query(r.Context(), `SELECT DISTINCT action FROM audit_logs ORDER BY action`)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer actionRows.Close()
+	actions := make([]string, 0)
+	for actionRows.Next() {
+		var action string
+		if actionRows.Scan(&action) == nil {
+			actions = append(actions, action)
+		}
+	}
+	resourceRows, err := a.Service.DB.Query(r.Context(), `SELECT DISTINCT resource_type FROM audit_logs ORDER BY resource_type`)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer resourceRows.Close()
+	resourceTypes := make([]string, 0)
+	for resourceRows.Next() {
+		var resourceType string
+		if resourceRows.Scan(&resourceType) == nil {
+			resourceTypes = append(resourceTypes, resourceType)
+		}
+	}
+	writeJSON(w, 200, map[string]any{"items": rows, "page": page, "page_size": pageSize, "total": total, "actions": actions, "resource_types": resourceTypes, "scope": scope})
 }
