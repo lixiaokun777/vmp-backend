@@ -179,7 +179,7 @@ func (s *Service) DecideApproval(ctx context.Context, reviewer, approvalID, deci
 			return nil, errors.New("调整后的租期必须在 1-720 小时之间")
 		}
 		requestedHours = adjustedHours
-		if _, err := tx.Exec(ctx, `UPDATE approval_requests SET requested_hours=$1,payload=jsonb_set(payload,'{lease_hours}',to_jsonb($1::integer),true),updated_at=now() WHERE id=$2::uuid`, requestedHours, approvalID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE approval_requests SET requested_hours=$1,payload=jsonb_set(payload,CASE WHEN request_type='CREATE' THEN '{lease_hours}'::text[] ELSE '{hours}'::text[] END,to_jsonb($1::integer),true),updated_at=now() WHERE id=$2::uuid`, requestedHours, approvalID); err != nil {
 			tx.Rollback(ctx)
 			return nil, err
 		}
@@ -215,7 +215,8 @@ func (s *Service) DecideApproval(ctx context.Context, reviewer, approvalID, deci
 	switch requestType {
 	case "CREATE":
 		var input CreateApplicationInput
-		if json.Unmarshal(payload, &input) != nil {
+		input, err = decodeCreateApprovalPayload(payload, requestedHours)
+		if err != nil {
 			err = errors.New("创建申请负载无效")
 		} else {
 			result, err = s.createApplicationNow(ctx, applicant, input)
@@ -248,6 +249,15 @@ func (s *Service) DecideApproval(ctx context.Context, reviewer, approvalID, deci
 	return map[string]any{"id": approvalID, "status": "APPROVED", "result": result}, nil
 }
 
+func decodeCreateApprovalPayload(payload []byte, approvedHours int) (CreateApplicationInput, error) {
+	var input CreateApplicationInput
+	if err := json.Unmarshal(payload, &input); err != nil {
+		return CreateApplicationInput{}, err
+	}
+	input.LeaseHours = approvedHours
+	return input, nil
+}
+
 func (s *Service) WithdrawApproval(ctx context.Context, actor, approvalID string) error {
 	if !uuidPattern.MatchString(approvalID) {
 		return errors.New("审批单编号无效")
@@ -269,9 +279,9 @@ func (s *Service) ResubmitApprovalShort(ctx context.Context, actor string, admin
 	}
 	var requestType, applicant, instanceID string
 	var payload []byte
-	err := s.DB.QueryRow(ctx, `SELECT request_type,applicant,coalesce(instance_id::text,''),payload FROM approval_requests WHERE id=$1::uuid AND status IN ('REJECTED','EXPIRED','FAILED')`, approvalID).Scan(&requestType, &applicant, &instanceID, &payload)
+	err := s.DB.QueryRow(ctx, `SELECT request_type,applicant,coalesce(instance_id::text,''),payload FROM approval_requests WHERE id=$1::uuid AND status IN ('REJECTED','EXPIRED','FAILED','WITHDRAWN')`, approvalID).Scan(&requestType, &applicant, &instanceID, &payload)
 	if err != nil {
-		return nil, errors.New("只有被拒绝、超时或执行失败的审批单可以改为短租期重提")
+		return nil, errors.New("只有被拒绝、超时、执行失败或已撤回的审批单可以改为短租期重提")
 	}
 	if applicant != actor && !administrator {
 		return nil, errors.New("审批单不属于当前用户")

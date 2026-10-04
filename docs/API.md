@@ -31,10 +31,10 @@
 - `POST /api/v1/instances/{id}/renew`：按小时续期，允许 1-720 小时并必须填写 `reason`；超过 168 小时进入审批。
 - `POST /api/v1/instances/{id}/restore`：恢复仍在 7 天保留期内的实例，必须填写 `reason`；复用原磁盘和原 IP且每台实例最多恢复一次，恢复租期超过 168 小时进入审批。
 - `GET /api/v1/approvals`：普通用户只能查看自己的审批单；管理员查看全部审批单，可用 `status` 筛选，`scope=mine` 查看本人提交。
-- `POST /api/v1/approvals/{id}/decision`：管理员批准或拒绝审批，`decision=APPROVE|REJECT`；拒绝必须填写 `comment`，批准可用 `adjusted_hours` 调整租期。接口只处理仍为待审批且未超时的记录，避免重复批准。
+- `POST /api/v1/approvals/{id}/decision`：管理员批准或拒绝审批，`decision=APPROVE|REJECT`；拒绝必须填写 `comment`，批准可用 `adjusted_hours` 调整租期，调整值会覆盖创建、续期或恢复操作的实际执行租期。接口只处理仍为待审批且未超时的记录，避免重复批准。
 - `POST /api/v1/approvals/batch-decision`：管理员批量批准或拒绝最多 50 个审批单，逐条返回执行结果。
 - `POST /api/v1/approvals/{id}/withdraw`：申请人撤回仍为待审批的申请。
-- `POST /api/v1/approvals/{id}/resubmit-short`：被拒绝、超时或执行失败后，申请人改为不超过 168 小时的短租期并立即执行。
+- `POST /api/v1/approvals/{id}/resubmit-short`：被拒绝、超时、执行失败或主动撤回后，申请人改为不超过 168 小时的短租期并立即执行。
 - `POST /api/v1/instances/{id}/console-sessions`：请求 `mode=vnc|serial`，仅实例所有者或管理员可用。返回 Agent WebSocket 地址和 5 分钟有效的一次性票据，仅运行中实例可建立会话。
 - `POST /api/v1/agents/{id}/console-sessions/{sessionID}/consume`：Agent 使用运行令牌原子核销一次性票据，仅供内部调用。
 - `GET /api/v1/audit-logs`：管理员查询平台操作流水，支持 `keyword`、`action`、`resource_type`、`outcome`、`scope`、`from`、`to`、`page`和 `page_size`，并返回动态动作与资源类型选项。
