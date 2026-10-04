@@ -62,7 +62,7 @@
   "instance_id": "123e4567-e89b-42d3-a456-426614174000",
   "status": "APPROVED",
   "connection": {
-    "ip_address": "10.200.9.20",
+    "ip_address": "192.168.50.100",
     "username": "ubuntu",
     "password": "仅在本次响应中返回",
     "available_after_provisioning": true

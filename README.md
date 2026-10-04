@@ -1,5 +1,7 @@
 # VMP Backend
 
+[Docker Hub](https://hub.docker.com/r/lixiaokun/vmp-backend) · [完整部署指南](docs/部署指南.md)
+
 VMP 虚拟机申领平台的控制面。负责资源规格、镜像、网络 IP、宿主机、申请、实例和 Agent 任务的统一管理。
 
 ## 当前能力
@@ -26,16 +28,16 @@ VMP 虚拟机申领平台的控制面。负责资源规格、镜像、网络 IP�
 
 ## 快速启动
 
-完整开源部署推荐把 `vmp-backend` 与 `vmp-frontend` 克隆到同一父目录，然后使用仓库提供的完整 Compose：
+开源部署只需要克隆本仓库，默认直接拉取 Docker Hub 上经过标记的控制面和前端镜像：
 
 ```bash
 cp .env.example .env
 chmod 600 .env
-docker compose --env-file .env -f deployments/compose/compose.yaml up -d --build
+docker compose --env-file .env -f deployments/compose/compose.yaml up -d
 curl http://127.0.0.1:8080/api/v1/health
 ```
 
-该 Compose 会启动 PostgreSQL、控制面和 Web，默认访问地址为 `http://localhost:8080`。首次启动时 PostgreSQL 会按文件名顺序执行 `migrations/` 中的 SQL。生产环境升级不应依赖容器首启机制，应使用受控的数据库迁移流程。
+该 Compose 会启动 PostgreSQL、控制面和 Web，默认访问地址为 `http://localhost:8080`。首次启动时 PostgreSQL 会按文件名顺序执行 `migrations/` 中的 SQL。生产环境升级不应依赖容器首启机制，应使用受控的数据库迁移流程。需要从源码构建时，再克隆同级的 `vmp-frontend` 并叠加 `deployments/compose/compose.build.yaml`。
 
 从系统要求、密钥生成、KVM 宿主机纳管、镜像和网络准备，到备份、升级、回滚和排障的完整说明见 [完整部署指南](docs/部署指南.md)。
 
@@ -51,3 +53,7 @@ go run ./cmd/control-plane
 ## 文档同步规则
 
 接口、数据表、调度规则、配置或部署方式变更时，同一次提交必须更新 `README.md`、`docs/` 和 `CHANGELOG.md`。项目内人工编写的注释统一使用中文。
+
+## 开源与贡献
+
+项目采用 [Apache License 2.0](LICENSE)。提交改进前请阅读 [参与贡献](CONTRIBUTING.md)；安全问题请按 [安全策略](SECURITY.md) 私下报告。
