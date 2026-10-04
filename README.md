@@ -26,13 +26,18 @@ VMP 虚拟机申领平台的控制面。负责资源规格、镜像、网络 IP�
 
 ## 快速启动
 
+完整开源部署推荐把 `vmp-backend` 与 `vmp-frontend` 克隆到同一父目录，然后使用仓库提供的完整 Compose：
+
 ```bash
 cp .env.example .env
-docker compose up --build
+chmod 600 .env
+docker compose --env-file .env -f deployments/compose/compose.yaml up -d --build
 curl http://127.0.0.1:8080/api/v1/health
 ```
 
-首次启动时 PostgreSQL 会按文件名顺序执行 `migrations/` 中的 SQL。生产环境不应依赖容器首启机制，应使用受控的数据库迁移流程。
+该 Compose 会启动 PostgreSQL、控制面和 Web，默认访问地址为 `http://localhost:8080`。首次启动时 PostgreSQL 会按文件名顺序执行 `migrations/` 中的 SQL。生产环境升级不应依赖容器首启机制，应使用受控的数据库迁移流程。
+
+从系统要求、密钥生成、KVM 宿主机纳管、镜像和网络准备，到备份、升级、回滚和排障的完整说明见 [完整部署指南](docs/部署指南.md)。
 
 ## 本地开发
 

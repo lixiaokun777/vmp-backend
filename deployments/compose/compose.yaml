@@ -1,0 +1,79 @@
+name: vmlease
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # 这些脚本只会在全新空数据库第一次启动时自动执行。
+      - ../../migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging:
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  control-plane:
+    build:
+      context: ../..
+    restart: unless-stopped
+    environment:
+      LISTEN_ADDR: :8080
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      AGENT_BOOTSTRAP_TOKEN: ${AGENT_BOOTSTRAP_TOKEN}
+      AGENT_RUNTIME_TOKEN: ${AGENT_RUNTIME_TOKEN}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY}
+      CONSOLE_SIGNING_KEY: ${CONSOLE_SIGNING_KEY}
+      LDAP_URL: ${LDAP_URL:-}
+      LDAP_START_TLS: ${LDAP_START_TLS:-false}
+      LDAP_BIND_DN: ${LDAP_BIND_DN:-}
+      LDAP_BIND_PASSWORD: ${LDAP_BIND_PASSWORD:-}
+      LDAP_BASE_DN: ${LDAP_BASE_DN:-}
+      LDAP_LOGIN_FILTER: ${LDAP_LOGIN_FILTER:-(uid=%s)}
+      LDAP_SYNC_FILTER: ${LDAP_SYNC_FILTER:-(objectClass=person)}
+      LDAP_USERNAME_ATTRIBUTE: ${LDAP_USERNAME_ATTRIBUTE:-uid}
+      LDAP_DISPLAY_NAME_ATTRIBUTE: ${LDAP_DISPLAY_NAME_ATTRIBUTE:-cn}
+      LDAP_EMAIL_ATTRIBUTE: ${LDAP_EMAIL_ATTRIBUTE:-mail}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/v1/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    logging:
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  web:
+    build:
+      # 默认要求 vmp-backend 与 vmp-frontend 位于同一父目录。
+      context: ../../../vmp-frontend
+    restart: unless-stopped
+    ports:
+      - "${VMP_HTTP_BIND:-0.0.0.0}:${VMP_HTTP_PORT:-8080}:80"
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    logging:
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  postgres-data:
