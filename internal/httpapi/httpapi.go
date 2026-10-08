@@ -23,6 +23,7 @@ type API struct {
 	AgentToken            string
 	SessionTTL            time.Duration
 	SessionSecure         bool
+	TrustedProxies        []netip.Prefix
 	SettingsEncryptionKey []byte
 	ConsoleSigningKey     []byte
 	LDAP                  LDAPConfig

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,17 +28,6 @@ func (w *auditResponseWriter) Write(data []byte) (int, error) {
 	return w.ResponseWriter.Write(data)
 }
 
-func requestSourceIP(r *http.Request) string {
-	value := r.RemoteAddr
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		value = strings.TrimSpace(strings.Split(forwarded, ",")[0])
-	}
-	if host, _, err := net.SplitHostPort(value); err == nil {
-		return host
-	}
-	return value
-}
-
 func (a *API) recordAudit(ctx context.Context, r *http.Request, actor, action, resourceType, resourceID, outcome string, detail any) {
 	if actor == "" {
 		actor = "anonymous"
@@ -55,7 +43,7 @@ func (a *API) recordAudit(ctx context.Context, r *http.Request, actor, action, r
 		payload = []byte(`{}`)
 	}
 	requestID := r.Header.Get("X-Request-ID")
-	_, _ = a.Service.DB.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail,outcome,source_ip,user_agent,request_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, actor, action, resourceType, resourceID, payload, outcome, requestSourceIP(r), r.UserAgent(), requestID)
+	_, _ = a.Service.DB.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail,outcome,source_ip,user_agent,request_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, actor, action, resourceType, resourceID, payload, outcome, a.clientIP(r), r.UserAgent(), requestID)
 }
 
 // auditMutation 只补齐管理类变更。申请和实例生命周期由业务事务自身记录，避免重复。

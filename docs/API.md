@@ -11,6 +11,8 @@
 
 ## 登录与用户
 
+登录保护自后端 0.4.4 起默认开启：同 IP 每分钟最多 30 次；同来源账号 15 分钟最多 5 次。超限返回 429、中文错误及 Retry-After 秒数；保护存储异常返回 503。未知账号适用相同规则。详细代理配置见 [登录保护](登录保护.md)。
+
 - `POST /api/v1/auth/login`：请求通过 `source=LOCAL|LDAP` 明确选择平台账号或 LDAP 账号；账号来源不匹配时拒绝登录。成功后写入 HttpOnly 会话 Cookie。
 - `POST /api/v1/auth/logout`、`GET /api/v1/auth/me`：退出登录和读取当前账号。
 - `POST /api/v1/auth/password`：本地用户修改自己的密码，修改成功后清理该账号的其他登录会话。

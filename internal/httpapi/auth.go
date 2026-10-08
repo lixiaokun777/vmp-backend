@@ -32,6 +32,14 @@ func userFromRequest(r *http.Request) (AuthUser, bool) {
 }
 
 func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	r = r.WithContext(ctx)
+	w.Header().Set("Cache-Control", "no-store")
+	if _, ok := a.allowLogin(w, r, loginBucketKey("ip", a.clientIP(r)), 30, time.Minute); !ok {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8192)
 	var input struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -55,6 +63,14 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 	if input.Username == "" || input.Password == "" {
 		a.recordAudit(r.Context(), r, input.Username, "auth.login", "session", input.Username, "FAILED", map[string]any{"source": input.Source, "reason": "missing_credentials"})
 		writeError(w, 422, "请输入用户名和密码")
+		return
+	}
+	if len(input.Username) > 256 || len(input.Password) > 1024 {
+		writeError(w, 422, "登录信息过长")
+		return
+	}
+	reservation, ok := a.allowLogin(w, r, loginBucketKey("account", input.Source+":"+strings.ToLower(input.Username)), 5, 15*time.Minute)
+	if !ok {
 		return
 	}
 	var user AuthUser
@@ -86,10 +102,7 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
 	tokenHash := sha256.Sum256([]byte(token))
 	expiresAt := time.Now().Add(a.SessionTTL)
-	remoteAddress := r.RemoteAddr
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		remoteAddress = strings.TrimSpace(strings.Split(forwarded, ",")[0])
-	}
+	remoteAddress := a.clientIP(r)
 	if _, err := a.Service.DB.Exec(r.Context(), `INSERT INTO user_sessions(token_hash,user_id,expires_at,remote_address,user_agent) VALUES($1,$2::uuid,$3,$4,$5)`, tokenHash[:], user.ID, expiresAt, remoteAddress, r.UserAgent()); err != nil {
 		writeError(w, 500, "无法创建登录会话")
 		return
@@ -97,6 +110,7 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 	_, _ = a.Service.DB.Exec(r.Context(), `UPDATE users SET last_login_at=now(),updated_at=now() WHERE id=$1::uuid`, user.ID)
 	a.recordAudit(r.Context(), r, user.Username, "auth.login", "user", user.ID, "SUCCESS", map[string]any{"source": user.Source})
 	a.setSessionCookie(w, token, expiresAt)
+	a.resetLoginReservation(r.Context(), reservation)
 	writeJSON(w, 200, map[string]any{"user": user, "expires_at": expiresAt})
 }
 

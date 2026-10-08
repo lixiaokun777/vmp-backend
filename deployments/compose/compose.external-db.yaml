@@ -2,7 +2,7 @@ name: vmlease
 
 services:
   control-plane:
-    image: ${VMP_BACKEND_IMAGE:-lixiaokun/vmp-backend:0.4.3}
+    image: ${VMP_BACKEND_IMAGE:-lixiaokun/vmp-backend:0.4.4}
     restart: unless-stopped
     environment:
       LISTEN_ADDR: :8080
@@ -13,6 +13,7 @@ services:
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD}
       SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
       SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY}
       CONSOLE_SIGNING_KEY: ${CONSOLE_SIGNING_KEY}
       LDAP_URL: ${LDAP_URL:-}
