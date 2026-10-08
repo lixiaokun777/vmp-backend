@@ -1,5 +1,13 @@
 # 变更记录
 
+## 0.4.1 - 2026-10-08
+
+- 数据库迁移改为由控制面在启动时自动执行，SQL 文件直接编译进后端二进制。
+- 增加 `schema_migrations` 迁移台账、SHA-256 完整性校验和 PostgreSQL advisory lock，支持多副本安全启动。
+- 将初始迁移改为幂等操作，支持自动接管没有迁移台账的旧版数据库。
+- 移除 PostgreSQL `/docker-entrypoint-initdb.d` SQL 挂载，新增只启动控制面和 Web 的外置 PostgreSQL Compose 文件。
+- 补充已有 PostgreSQL 部署、自动升级、权限和故障处理文档。
+
 ## 0.4.0 - 2026-10-04
 
 - 发布 Docker Hub 固定版本镜像部署方式，增加源码构建 Compose 覆盖文件和可替换基础镜像参数。

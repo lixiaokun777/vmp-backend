@@ -1,6 +1,6 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
-CREATE TABLE hosts (
+CREATE TABLE IF NOT EXISTS hosts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name text NOT NULL UNIQUE,
   provider_type text NOT NULL DEFAULT 'kvm',
@@ -18,7 +18,7 @@ CREATE TABLE hosts (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE flavors (
+CREATE TABLE IF NOT EXISTS flavors (
   id text PRIMARY KEY,
   name text NOT NULL,
   cpu integer NOT NULL,
@@ -27,7 +27,7 @@ CREATE TABLE flavors (
   enabled boolean NOT NULL DEFAULT true
 );
 
-CREATE TABLE images (
+CREATE TABLE IF NOT EXISTS images (
   id text PRIMARY KEY,
   name text NOT NULL,
   os_family text NOT NULL,
@@ -35,7 +35,7 @@ CREATE TABLE images (
   enabled boolean NOT NULL DEFAULT true
 );
 
-CREATE TABLE applications (
+CREATE TABLE IF NOT EXISTS applications (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   request_no text NOT NULL UNIQUE,
   applicant text NOT NULL,
@@ -49,7 +49,7 @@ CREATE TABLE applications (
   approved_at timestamptz
 );
 
-CREATE TABLE instances (
+CREATE TABLE IF NOT EXISTS instances (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   application_id uuid NOT NULL UNIQUE REFERENCES applications(id),
   host_id uuid REFERENCES hosts(id),
@@ -66,7 +66,7 @@ CREATE TABLE instances (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE tasks (
+CREATE TABLE IF NOT EXISTS tasks (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   idempotency_key text NOT NULL UNIQUE,
   task_type text NOT NULL,
@@ -85,10 +85,10 @@ CREATE TABLE tasks (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX tasks_poll_idx ON tasks(host_id, status, available_at);
-CREATE INDEX instances_status_idx ON instances(lifecycle_status);
+CREATE INDEX IF NOT EXISTS tasks_poll_idx ON tasks(host_id, status, available_at);
+CREATE INDEX IF NOT EXISTS instances_status_idx ON instances(lifecycle_status);
 
-CREATE TABLE audit_logs (
+CREATE TABLE IF NOT EXISTS audit_logs (
   id bigserial PRIMARY KEY,
   actor text NOT NULL,
   action text NOT NULL,
@@ -98,11 +98,32 @@ CREATE TABLE audit_logs (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-INSERT INTO flavors(id, name, cpu, memory_mb, disk_gb) VALUES
-  ('c1m2', '轻量型 1C2G', 1, 2048, 40),
-  ('c2m4', '标准型 2C4G', 2, 4096, 60),
-  ('c4m8', '增强型 4C8G', 4, 8192, 100);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM flavors) THEN
+    INSERT INTO flavors(id, name, cpu, memory_mb, disk_gb) VALUES
+      ('c1m2', '轻量型 1C2G', 1, 2048, 40),
+      ('c2m4', '标准型 2C4G', 2, 4096, 60),
+      ('c4m8', '增强型 4C8G', 4, 8192, 100);
+  END IF;
+END
+$$;
 
-INSERT INTO images(id, name, os_family, version) VALUES
-  ('ubuntu-2204', 'Ubuntu Server 22.04 LTS', 'ubuntu', '22.04'),
-  ('ubuntu-2404', 'Ubuntu Server 24.04 LTS', 'ubuntu', '24.04');
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM images) THEN
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema=current_schema() AND table_name='images' AND column_name='file_name'
+    ) THEN
+      INSERT INTO images(id, name, os_family, version, file_name) VALUES
+        ('ubuntu-2204', 'Ubuntu Server 22.04 LTS', 'ubuntu', '22.04', 'ubuntu-22.04-server-cloudimg-amd64.qcow2'),
+        ('ubuntu-2404', 'Ubuntu Server 24.04 LTS', 'ubuntu', '24.04', 'ubuntu-24.04-server-cloudimg-amd64.qcow2');
+    ELSE
+      INSERT INTO images(id, name, os_family, version) VALUES
+        ('ubuntu-2204', 'Ubuntu Server 22.04 LTS', 'ubuntu', '22.04'),
+        ('ubuntu-2404', 'Ubuntu Server 24.04 LTS', 'ubuntu', '24.04');
+    END IF;
+  END IF;
+END
+$$;

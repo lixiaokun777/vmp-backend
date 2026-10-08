@@ -14,6 +14,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"vmp-backend/internal/migrate"
 )
 
 type Service struct {
@@ -95,6 +97,10 @@ func New(ctx context.Context, databaseURL string) (*Service, error) {
 		return nil, err
 	}
 	if err := db.Ping(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := migrate.Run(ctx, db); err != nil {
 		db.Close()
 		return nil, err
 	}

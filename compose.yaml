@@ -9,8 +9,6 @@ services:
     volumes:
       # 数据库数据持久化到独立数据卷。
       - postgres-data:/var/lib/postgresql/data
-      # 仅用于开发环境首次初始化。
-      - ./migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s

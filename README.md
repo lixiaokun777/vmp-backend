@@ -25,6 +25,7 @@ VMP 虚拟机申领平台的控制面。负责资源规格、镜像、网络 IP�
 - 管理员可在 Web 中保存、启停、测试 LDAP 配置并同步用户，服务账号密码使用 AES-GCM 加密。
 - 提供平台级操作审计，记录操作人、动作、资源、结果、来源 IP、用户代理和时间；支持人工/系统事件隔离、资源类型和时间范围筛选，实例删除后审计流水仍保留。
 - 为实例所有者或管理员签发 5 分钟有效且只能核销一次的 VNC/串口控制台票据，不直接暴露 libvirt VNC 端口。
+- 数据库迁移文件编译进控制面二进制，启动时自动建立迁移台账并执行未应用的 SQL；支持自带 PostgreSQL 和已有外置 PostgreSQL。
 
 ## 快速启动
 
@@ -37,7 +38,7 @@ docker compose --env-file .env -f deployments/compose/compose.yaml up -d
 curl http://127.0.0.1:8080/api/v1/health
 ```
 
-该 Compose 会启动 PostgreSQL、控制面和 Web，默认访问地址为 `http://localhost:8080`。首次启动时 PostgreSQL 会按文件名顺序执行 `migrations/` 中的 SQL。生产环境升级不应依赖容器首启机制，应使用受控的数据库迁移流程。需要从源码构建时，再克隆同级的 `vmp-frontend` 并叠加 `deployments/compose/compose.build.yaml`。
+该 Compose 会启动 PostgreSQL、控制面和 Web，默认访问地址为 `http://localhost:8080`。控制面会在对外提供服务前自动执行数据库迁移，不再向 PostgreSQL 容器挂载 SQL 目录。使用已有 PostgreSQL 的部署方式见 [完整部署指南](docs/部署指南.md)。需要从源码构建时，再克隆同级的 `vmp-frontend` 并叠加 `deployments/compose/compose.build.yaml`。
 
 从系统要求、密钥生成、KVM 宿主机纳管、镜像和网络准备，到备份、升级、回滚和排障的完整说明见 [完整部署指南](docs/部署指南.md)。
 
