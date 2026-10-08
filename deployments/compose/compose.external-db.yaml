@@ -2,7 +2,7 @@ name: vmlease
 
 services:
   control-plane:
-    image: ${VMP_BACKEND_IMAGE:-lixiaokun/vmp-backend:0.4.1}
+    image: ${VMP_BACKEND_IMAGE:-lixiaokun/vmp-backend:0.4.2}
     restart: unless-stopped
     environment:
       LISTEN_ADDR: :8080

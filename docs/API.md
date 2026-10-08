@@ -50,6 +50,8 @@
 
 `CREATE_INSTANCE` 任务包含实例 UUID、名称、CPU、内存、磁盘、`image_file`、网桥、稳定生成的 `mac_address`、IP、前缀长度、网关、DNS、用户名和 `password_hash`。密码摘要由 PostgreSQL `pgcrypto` 生成，明文不写入任务、实例表或审计日志。
 
+Agent 在任何 KVM 写操作前探测候选 IP。收到 ICMP 回应时，任务结果返回 `error_code=IP_ADDRESS_IN_USE`。控制面将当前地址改为 `QUARANTINED`，把同一网络中下一个 `FREE` 地址预留给原实例，同步更新任务负载并立即重试。没有更多空闲地址时，创建任务进入 `FAILED`并返回明确的地址池耗尽原因。
+
 `START_INSTANCE`、`STOP_INSTANCE`、`REBOOT_INSTANCE` 和 `DELETE_INSTANCE` 只下发实例 UUID、域名和触发原因。到期实例会先关机并进入 7 天保留期；保留期结束后才下发删除任务、释放 IP 和宿主机配额。
 
 `RESET_INSTANCE_PASSWORD` 下发实例 UUID、域名、系统用户名和 crypt 密码摘要。明文新密码只存在于本次 HTTP 响应，不写入任务、实例表或审计日志。

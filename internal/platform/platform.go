@@ -88,6 +88,7 @@ type TaskResult struct {
 	Success     bool   `json:"success"`
 	ProviderRef string `json:"provider_ref"`
 	IPAddress   string `json:"ip_address"`
+	ErrorCode   string `json:"error_code"`
 	Error       string `json:"error"`
 }
 
@@ -616,6 +617,8 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 		if err == nil && (taskType == "CREATE_INSTANCE" || taskType == "START_INSTANCE") {
 			_, err = tx.Exec(ctx, `UPDATE approval_requests SET status='APPROVED',result=result-'error',updated_at=now() WHERE instance_id=$1::uuid AND status='APPROVED_FAILED' AND ((request_type='CREATE' AND $2='CREATE_INSTANCE') OR (request_type='RESTORE' AND $2='START_INSTANCE'))`, resourceID, taskType)
 		}
+	} else if taskType == "CREATE_INSTANCE" && result.ErrorCode == "IP_ADDRESS_IN_USE" {
+		err = s.retryCreateWithNextIPAddress(ctx, tx, taskID, resourceID, result)
 	} else {
 		_, err = tx.Exec(ctx, `UPDATE tasks SET status=CASE WHEN attempt>=max_attempts THEN 'FAILED' ELSE 'PENDING' END,error_message=$1,available_at=now()+interval '15 seconds',completed_at=CASE WHEN attempt>=max_attempts THEN now() ELSE NULL END,updated_at=now() WHERE id=$2::uuid`, result.Error, taskID)
 		if err == nil && attempt >= maxAttempts {
@@ -633,6 +636,55 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// retryCreateWithNextIPAddress 隔离已被外部设备占用的地址，并让原创建任务立即换用下一个候选 IP。
+func (s *Service) retryCreateWithNextIPAddress(ctx context.Context, tx pgx.Tx, taskID, instanceID string, result TaskResult) error {
+	var occupiedID, networkID, occupiedAddress string
+	err := tx.QueryRow(ctx, `SELECT id::text,network_id::text,host(address) FROM ip_addresses WHERE instance_id=$1::uuid FOR UPDATE`, instanceID).Scan(&occupiedID, &networkID, &occupiedAddress)
+	if err != nil {
+		return fmt.Errorf("locate occupied instance IP: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE ip_addresses SET status='QUARANTINED',instance_id=NULL,reserved_at=NULL,allocated_at=NULL,updated_at=now() WHERE id=$1::uuid`, occupiedID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE instances SET ip_address=NULL,updated_at=now() WHERE id=$1::uuid`, instanceID); err != nil {
+		return err
+	}
+
+	var nextID, nextAddress string
+	err = tx.QueryRow(ctx, `SELECT id::text,host(address) FROM ip_addresses WHERE network_id=$1::uuid AND status='FREE' ORDER BY address FOR UPDATE SKIP LOCKED LIMIT 1`, networkID).Scan(&nextID, &nextAddress)
+	if errors.Is(err, pgx.ErrNoRows) {
+		message := fmt.Sprintf("IP %s 已被占用，地址池中没有其他可用 IP", occupiedAddress)
+		data, _ := json.Marshal(result)
+		if _, updateErr := tx.Exec(ctx, `UPDATE tasks SET status='FAILED',result=$1,error_message=$2,completed_at=now(),updated_at=now() WHERE id=$3::uuid`, data, message, taskID); updateErr != nil {
+			return updateErr
+		}
+		if _, updateErr := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='ERROR',updated_at=now() WHERE id=$1::uuid`, instanceID); updateErr != nil {
+			return updateErr
+		}
+		if _, updateErr := tx.Exec(ctx, `UPDATE approval_requests SET status='APPROVED_FAILED',result=coalesce(result,'{}'::jsonb)||jsonb_build_object('error',$1::text),updated_at=now() WHERE instance_id=$2::uuid AND status='APPROVED' AND request_type='CREATE'`, message, instanceID); updateErr != nil {
+			return updateErr
+		}
+		_, updateErr := tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,outcome,detail) VALUES ('system','ip.address.quarantine','ip_address',$1,'SUCCESS',jsonb_build_object('address',$2::text,'reason','icmp_reply','replacement',NULL))`, occupiedID, occupiedAddress)
+		return updateErr
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE ip_addresses SET status='RESERVED',instance_id=$1::uuid,reserved_at=now(),updated_at=now() WHERE id=$2::uuid`, instanceID, nextID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE instances SET ip_address=$1::inet,updated_at=now() WHERE id=$2::uuid`, nextAddress, instanceID); err != nil {
+		return err
+	}
+	data, _ := json.Marshal(result)
+	message := fmt.Sprintf("IP %s 已被占用，已自动切换为 %s 并重试", occupiedAddress, nextAddress)
+	if _, err := tx.Exec(ctx, `UPDATE tasks SET status='PENDING',attempt=0,result=$1,error_message=$2,payload=jsonb_set(payload,'{ip_address}',to_jsonb($3::text),true),available_at=now(),claimed_at=NULL,completed_at=NULL,updated_at=now() WHERE id=$4::uuid`, data, message, nextAddress, taskID); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,outcome,detail) VALUES ('system','ip.address.quarantine','ip_address',$1,'SUCCESS',jsonb_build_object('address',$2::text,'reason','icmp_reply','replacement',$3::text,'instance_id',$4::text))`, occupiedID, occupiedAddress, nextAddress, instanceID)
+	return err
 }
 
 func (s *Service) applySuccessfulTask(ctx context.Context, tx pgx.Tx, taskType, resourceID string, result TaskResult) error {
