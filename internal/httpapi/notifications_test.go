@@ -39,12 +39,12 @@ func TestNotificationSignatureAndRejection(t *testing.T) {
 			t.Error(err)
 		}
 		var payload struct {
-			Msgtype string `json:"msgtype"`
-			Text    struct {
-				Content string `json:"content"`
-			} `json:"text"`
+			Msgtype  string `json:"msgtype"`
+			Markdown struct {
+				Text string `json:"text"`
+			} `json:"markdown"`
 		}
-		if json.Unmarshal(body, &payload) != nil || payload.Msgtype != "text" || payload.Text.Content != "【北斗云台】测试" {
+		if json.Unmarshal(body, &payload) != nil || payload.Msgtype != "markdown" || payload.Markdown.Text != "【北斗云台】测试" {
 			t.Error("消息格式不匹配")
 		}
 		if count.Add(1) == 1 {
@@ -123,6 +123,35 @@ func TestNotificationMessageEscapesMentions(t *testing.T) {
 	}
 	if !strings.Contains(message, "/#/my-instances") {
 		t.Fatal("缺少平台链接")
+	}
+}
+
+func TestNotificationMarkdownLayout(t *testing.T) {
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	c := notificationSettings{PlatformURL: "https://vmp.example.com/path(x)", MentionOwner: true}
+	items := []notificationCandidate{
+		{Instance: notificationInstance{Name: "dev-api", Owner: "alice", DisplayName: "张三", Email: "alice@example.com"}, Kind: "LEASE_1", TargetAt: now.Add(30 * time.Minute)},
+		{Instance: notificationInstance{Name: "test-db", Owner: "bob"}, Kind: "RETAINED", TargetAt: now.Add(6 * 24 * time.Hour)},
+		{Instance: notificationInstance{Name: "old-build", Owner: "carol"}, Kind: "RETENTION_END", TargetAt: now.Add(12 * time.Hour)},
+	}
+	message := notificationMessage(c, items, now)
+	for _, want := range []string{"## 🖥️", "**3 台**", "### 1. dev-api", "### 2. test-db", "### 3. old-build", "2026-10-08 20:30:00", "**30 分钟**", "#DC2626", "#D97706", "磁盘将被删除", "path%28x%29/#/my-instances", "<at email=\"alice@example.com\">"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("缺少消息样式 %q：%s", want, message)
+		}
+	}
+	if strings.Count(message, "超过 7 天的续期") != 1 || strings.Count(message, "**处理提示**") != 1 {
+		t.Fatal("处理说明重复")
+	}
+	for _, bad := range []string{"[点击](https://evil.example)", "**all**", "## header", "`code`", "<at user_id=\"-1\">all</at>"} {
+		value := notificationText(bad)
+		if strings.ContainsAny(value, "[]()*#`<>") {
+			t.Fatalf("Markdown 注入未转义：%s", value)
+		}
+	}
+	testMessage := notificationTestMessage(c)
+	if !strings.Contains(testMessage, "不代表任何实例到期") || !strings.Contains(testMessage, "[查看我的虚拟机]") {
+		t.Fatal("测试通知缺少安全说明或入口")
 	}
 }
 

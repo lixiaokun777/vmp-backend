@@ -207,7 +207,7 @@ func sendRobotMessage(ctx context.Context, c notificationSettings, message strin
 	if utf8.RuneCountInString(message) > 4500 {
 		return errors.New("群消息超过安全长度限制")
 	}
-	payload, err := json.Marshal(map[string]any{"msgtype": "text", "text": map[string]string{"content": message}})
+	payload, err := json.Marshal(map[string]any{"msgtype": "markdown", "markdown": map[string]string{"text": message}})
 	if err != nil {
 		return errors.New("无法构造群消息")
 	}
@@ -310,7 +310,8 @@ func reminderCandidate(c notificationSettings, i notificationInstance, now time.
 
 func notificationText(value string) string {
 	value = strings.Join(strings.Fields(value), " ")
-	value = strings.NewReplacer("<", "＜", ">", "＞", "@", "＠").Replace(value)
+	// 外部字段不允许注入 Markdown 链接、强调、标题或机器人 @ 标签。
+	value = strings.NewReplacer("<", "＜", ">", "＞", "@", "＠", "*", "＊", "_", "＿", "~", "～", "[", "［", "]", "］", "(", "（", ")", "）", "#", "＃", "`", "｀", "!", "！", "\\", "＼", "|", "｜").Replace(value)
 	runes := []rune(value)
 	if len(runes) > 64 {
 		value = string(runes[:64]) + "…"
@@ -320,9 +321,11 @@ func notificationText(value string) string {
 
 func notificationMessage(c notificationSettings, items []notificationCandidate, now time.Time) string {
 	var b strings.Builder
-	b.WriteString("【北斗云台】虚拟机租期提醒\n")
+	b.WriteString("## 🖥️ 【北斗云台】虚拟机租期提醒\n\n")
+	fmt.Fprintf(&b, "> 本次提醒 **%d 台** 实例 · 时间均为北京时间\n\n", len(items))
 	zone := time.FixedZone("Asia/Shanghai", 8*3600)
-	for _, item := range items {
+	var lease, retained, ending bool
+	for index, item := range items {
 		i := item.Instance
 		owner := notificationText(i.DisplayName)
 		if owner == "" {
@@ -332,13 +335,16 @@ func notificationMessage(c notificationSettings, items []notificationCandidate, 
 		if email, err := mail.ParseAddress(i.Email); c.MentionOwner && len(i.Email) <= 254 && err == nil && email.Address == i.Email {
 			owner = `<at email="` + html.EscapeString(email.Address) + `">` + html.EscapeString(owner) + `</at>`
 		}
-		fmt.Fprintf(&b, "\n实例：%s\n使用人：%s\n", notificationText(i.Name), owner)
+		fmt.Fprintf(&b, "### %d. %s\n\n- **使用人：** %s\n", index+1, notificationText(i.Name), owner)
 		switch item.Kind {
 		case "RETAINED":
-			fmt.Fprintf(&b, "状态：已进入保留期，原磁盘和 IP 仍保留\n最终删除时间：%s\n请及时进入平台恢复或确认不再使用。\n", item.TargetAt.In(zone).Format("2006-01-02 15:04:05"))
+			retained = true
+			fmt.Fprintf(&b, "- **状态：** <font color='#D97706'>已进入保留期</font>\n- **最终删除：** %s\n- **资源：** 原磁盘和 IP 仍保留，可进入平台恢复\n\n", item.TargetAt.In(zone).Format("2006-01-02 15:04:05"))
 		case "RETENTION_END":
-			fmt.Fprintf(&b, "状态：保留期将在 24 小时内结束\n最终删除时间：%s\n届时磁盘将被删除并释放 IP，请立即恢复或备份所需数据。\n", item.TargetAt.In(zone).Format("2006-01-02 15:04:05"))
+			ending = true
+			fmt.Fprintf(&b, "- **状态：** <font color='#DC2626'>保留期即将结束 · 磁盘将被删除</font>\n- **最终删除：** %s\n- **请立即：** 恢复实例或备份所需数据\n\n", item.TargetAt.In(zone).Format("2006-01-02 15:04:05"))
 		default:
+			lease = true
 			minutes := int(item.TargetAt.Sub(now).Minutes())
 			if minutes < 1 {
 				minutes = 1
@@ -347,14 +353,42 @@ func notificationMessage(c notificationSettings, items []notificationCandidate, 
 			if minutes >= 60 {
 				remaining = fmt.Sprintf("%d 小时 %d 分钟", minutes/60, minutes%60)
 			}
-			fmt.Fprintf(&b, "到期时间：%s（北京时间）\n剩余：%s\n请提前续期；超过 7 天的续期需要管理员审批。\n", item.TargetAt.In(zone).Format("2006-01-02 15:04:05"), remaining)
+			color := "#D97706"
+			if minutes <= 60 {
+				color = "#DC2626"
+			}
+			fmt.Fprintf(&b, "- **状态：** <font color='%s'>即将到期</font>\n- **到期时间：** %s\n- **剩余时间：** <font color='%s'>**%s** </font>\n\n", color, item.TargetAt.In(zone).Format("2006-01-02 15:04:05"), color, remaining)
 		}
 	}
 	if c.PlatformURL != "" {
-		fmt.Fprintf(&b, "\n前往我的虚拟机：%s/#/my-instances\n", c.PlatformURL)
+		fmt.Fprintf(&b, "### 🔗 [查看我的虚拟机 · 续期 / 恢复](%s)\n\n", notificationPlatformLink(c.PlatformURL))
 	}
-	b.WriteString("\n普通到期回收会保留原磁盘和 IP 7 天；已恢复过一次的实例不再享受第二次保留期。群消息不会包含密码或控制台票据。")
+	b.WriteString("**处理提示**\n\n")
+	if lease {
+		b.WriteString("> 请在到期前续期；超过 7 天的续期需管理员审批。\n\n")
+	}
+	if retained {
+		b.WriteString("> 暂时不需要的实例可保持保留状态；需要继续使用时请在最终删除前恢复。\n\n")
+	}
+	if ending {
+		b.WriteString("> 最终删除后无法恢复磁盘，IP 也将释放，请及时处理。\n\n")
+	}
+	b.WriteString("> 普通到期回收保留原磁盘和 IP 7 天；已恢复过一次的实例不再享受第二次保留期。")
 	return b.String()
+}
+
+// URL 的 Markdown 结构字符必须编码，不能让配置路径破坏链接边界。
+func notificationPlatformLink(base string) string {
+	target := strings.TrimRight(base, "/") + "/#/my-instances"
+	return strings.NewReplacer("(", "%28", ")", "%29", "[", "%5B", "]", "%5D", "<", "%3C", ">", "%3E", " ", "%20", "\\", "%5C", "\n", "%0A", "\r", "%0D").Replace(target)
+}
+
+func notificationTestMessage(c notificationSettings) string {
+	message := "## ✅ 【北斗云台】群通知测试\n\n> **发送链路正常** · 此消息由管理员主动发送\n\n**新版通知样式**\n\n- 实例按独立分区展示，重要字段加粗\n- <font color='#D97706'>即将到期</font> · <font color='#DC2626'>保留期即将结束</font>\n- 支持 @ 使用人及平台链接\n\n"
+	if c.PlatformURL != "" {
+		message += fmt.Sprintf("### 🔗 [查看我的虚拟机](%s)\n\n", notificationPlatformLink(c.PlatformURL))
+	}
+	return message + "> 这是一条样式与连通性测试，不代表任何实例到期，也不会修改虚拟机租期。"
 }
 
 func (a *API) beginNotification(ctx context.Context) (pgx.Tx, error) {
@@ -386,7 +420,7 @@ func (a *API) testNotification(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 429, "测试消息发送过于频繁，请等待至少 3 秒")
 		return
 	}
-	message := "【北斗云台】群通知测试\n这是一条管理员主动发送的测试消息。收到此消息说明平台服务器到群机器人的发送链路正常。此消息不会修改虚拟机租期。"
+	message := notificationTestMessage(c)
 	user, _ := userFromRequest(r)
 	now := time.Now()
 	err = sendRobotMessage(r.Context(), c, message)

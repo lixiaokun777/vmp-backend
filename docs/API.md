@@ -2,6 +2,8 @@
 
 ## 群通知（仅管理员）
 
+后端 0.4.5 起自动与测试消息均使用 Markdown，发送记录中的 message 为原始 Markdown 文本。配置和接口结构不变，不向群发送敏感凭据。具体样式见 [群通知](群通知.md)。
+
 - `GET /api/v1/notifications/config`：读取规则、打码地址和最近发送结果，不返回明文凭据。
 - `PUT /api/v1/notifications/config`：保存 `enabled`、`webhook_url`、`signature_secret`、`platform_url`、`reminder_hours`、`notify_retained`、`notify_retention_end`、`mention_owner`；凭据留空保持不变，`clear_webhook` / `clear_signature_secret` 可清除。提醒时间为 1–168 小时、最多 5 个不重复整数。
 - `POST /api/v1/notifications/test`：向已保存机器人发送测试消息，自动通知关闭时仍可测试，至少间隔 3 秒；成功后须到群确认收件。
