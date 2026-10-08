@@ -108,6 +108,8 @@ func auditMutationTarget(r *http.Request) (string, string, string, bool) {
 	case "ldap":
 		action := "ldap." + resourceID
 		return action, "configuration", "ldap", true
+	case "notifications":
+		return "notifications." + resourceID, "configuration", "notifications", true
 	case "hosts", "flavors", "images", "networks":
 		actionName := map[string]string{http.MethodPost: "create", http.MethodPatch: "update", http.MethodDelete: "delete"}[r.Method]
 		if len(parts) > 2 {

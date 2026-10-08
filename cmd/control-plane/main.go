@@ -53,6 +53,7 @@ func main() {
 		slog.Error("bootstrap administrator failed", "error", err)
 		os.Exit(1)
 	}
+	go api.StartNotificationLoop(ctx)
 	server := &http.Server{Addr: env("LISTEN_ADDR", ":8080"), Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()

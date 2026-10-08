@@ -1,5 +1,14 @@
 # API 说明
 
+## 群通知（仅管理员）
+
+- `GET /api/v1/notifications/config`：读取规则、打码地址和最近发送结果，不返回明文凭据。
+- `PUT /api/v1/notifications/config`：保存 `enabled`、`webhook_url`、`signature_secret`、`platform_url`、`reminder_hours`、`notify_retained`、`notify_retention_end`、`mention_owner`；凭据留空保持不变，`clear_webhook` / `clear_signature_secret` 可清除。提醒时间为 1–168 小时、最多 5 个不重复整数。
+- `POST /api/v1/notifications/test`：向已保存机器人发送测试消息，自动通知关闭时仍可测试，至少间隔 3 秒；成功后须到群确认收件。
+- `GET /api/v1/notifications/events?page=1&status=SENT`：每页 20 条，支持 `PENDING`、`SENT`、`FAILED`、`CANCELLED` 筛选。
+
+未登录返回 401，普通用户返回 403，配置不合法返回 422，测试限频返回 429、机器人错误返回 502。配置及测试写入审计但不记录凭据，自动发送默认关闭。详见 [群通知](群通知.md)。
+
 ## 登录与用户
 
 - `POST /api/v1/auth/login`：请求通过 `source=LOCAL|LDAP` 明确选择平台账号或 LDAP 账号；账号来源不匹配时拒绝登录。成功后写入 HttpOnly 会话 Cookie。

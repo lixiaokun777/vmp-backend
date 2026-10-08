@@ -21,7 +21,7 @@ services:
         max-file: "5"
 
   control-plane:
-    image: ${VMP_BACKEND_IMAGE:-lixiaokun/vmp-backend:0.4.2}
+    image: ${VMP_BACKEND_IMAGE:-lixiaokun/vmp-backend:0.4.3}
     restart: unless-stopped
     environment:
       LISTEN_ADDR: :8080
@@ -58,7 +58,7 @@ services:
         max-file: "5"
 
   web:
-    image: ${VMP_FRONTEND_IMAGE:-lixiaokun/vmp-frontend:0.4.0}
+    image: ${VMP_FRONTEND_IMAGE:-lixiaokun/vmp-frontend:0.4.2}
     restart: unless-stopped
     ports:
       - "${VMP_HTTP_BIND:-0.0.0.0}:${VMP_HTTP_PORT:-8080}:80"
