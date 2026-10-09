@@ -17,7 +17,7 @@ func (s *Service) releaseInstanceTx(ctx context.Context, tx pgx.Tx, instanceID, 
 	if status != "RUNNING" && status != "STOPPED" && status != "RETAINED" {
 		return nil, errors.New("当前状态不能释放实例")
 	}
-	if status == "RETAINED" && retentionUntil.After(time.Now()) {
+	if status == "RETAINED" && retentionAllowed(restoreCount) && retentionUntil.After(time.Now()) {
 		return map[string]any{"id": instanceID, "status": status, "retention_days": 7}, nil
 	}
 	retentionDays := 7

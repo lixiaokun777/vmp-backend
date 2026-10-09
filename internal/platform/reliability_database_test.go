@@ -190,6 +190,17 @@ func TestLeaseAndAllocationDatabase(t *testing.T) {
 			t.Fatal("手动释放和自然到期策略不一致")
 		}
 	})
+	t.Run("旧版本已经错误进入二次保留也应收敛", func(t *testing.T) {
+		s, host, network := reliabilityFixture(t)
+		id := reliabilityInstance(t, s, host, network, "legacy-retained", true)
+		mustExec(t, s, `UPDATE instances SET lifecycle_status='RETAINED',restore_count=1,expires_at=now()-interval '1 hour',retention_until=now()+interval '6 days' WHERE id=$1::uuid`, id)
+		if err := s.ReconcileInstanceLifecycle(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if stateOf(t, s, id) != "DELETING" {
+			t.Fatal("旧错误二次保留仍持续占用")
+		}
+	})
 	t.Run("规格编辑不影响旧实例及删除扣账", func(t *testing.T) {
 		s, host, network := reliabilityFixture(t)
 		first := reliabilityInstance(t, s, host, network, "first", true)

@@ -791,7 +791,7 @@ func (s *Service) ReconcileInstanceLifecycle(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, `SELECT id::text,host_id::text,name,lifecycle_status,restore_count,coalesce(retention_until,expires_at+interval '7 days') FROM instances i WHERE ((i.lifecycle_status IN ('RUNNING','STOPPED') AND i.expires_at<=now()) OR (i.lifecycle_status='RETAINED' AND i.retention_until<=now())) AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.resource_id=i.id AND (t.status IN ('PENDING','RUNNING') OR (t.status='FAILED' AND t.updated_at>=i.updated_at AND t.task_type IN ('STOP_INSTANCE','DELETE_INSTANCE')))) ORDER BY coalesce(i.retention_until,i.expires_at) FOR UPDATE OF i SKIP LOCKED LIMIT 50`)
+	rows, err := tx.Query(ctx, `SELECT id::text,host_id::text,name,lifecycle_status,restore_count,coalesce(retention_until,expires_at+interval '7 days') FROM instances i WHERE ((i.lifecycle_status IN ('RUNNING','STOPPED') AND i.expires_at<=now()) OR (i.lifecycle_status='RETAINED' AND (i.retention_until<=now() OR i.restore_count>0))) AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.resource_id=i.id AND (t.status IN ('PENDING','RUNNING') OR (t.status='FAILED' AND t.updated_at>=i.updated_at AND t.task_type IN ('STOP_INSTANCE','DELETE_INSTANCE')))) ORDER BY coalesce(i.retention_until,i.expires_at) FOR UPDATE OF i SKIP LOCKED LIMIT 50`)
 	if err != nil {
 		return err
 	}
