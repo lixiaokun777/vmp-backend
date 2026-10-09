@@ -293,6 +293,9 @@ func (s *Service) RegisterHost(ctx context.Context, in HostRegistration) (map[st
 }
 
 func (s *Service) Heartbeat(ctx context.Context, hostID string, hb Heartbeat) error {
+	// PostgreSQL timestamptz 只保存微秒；比较、JSON和各清单写入必须使用同一时间代际精度。
+	// 否则重发纳秒时间会始终晚于库内截断值，被错误识别为多次独立扫描。
+	hb.Facts.ResourceMeasuredAt = canonicalMeasurementTime(hb.Facts.ResourceMeasuredAt)
 	status := hb.Status
 	if status == "" {
 		status = "ACTIVE"
@@ -323,7 +326,7 @@ func (s *Service) Heartbeat(ctx context.Context, hostID string, hb Heartbeat) er
 		safeMemory, safeDisk, measured = hb.Facts.SafeAvailableMemoryMB, hb.Facts.SafeAvailableDiskGB, inventoryAt
 	} else {
 		budgetSource = "LEGACY"
-		inventoryAt = time.Now().UTC()
+		inventoryAt = canonicalMeasurementTime(time.Now())
 	}
 	freshInventory := budgetSource == "CONFIGURED_TOTAL" && hb.InventoryComplete && (previousInventory == nil || inventoryAt.After(*previousInventory))
 	tag, err := tx.Exec(ctx, `UPDATE hosts SET status=CASE WHEN status IN ('CORDONED','MAINTENANCE') THEN status ELSE $1 END,agent_allocatable_cpu=$2,agent_allocatable_memory_mb=$3,agent_allocatable_disk_gb=$4,allocatable_cpu=least($2,coalesce(quota_cpu,$2)),allocatable_memory_mb=least($3,coalesce(quota_memory_mb,$3)),allocatable_disk_gb=least($4,coalesce(quota_disk_gb,$4)),facts=$5,last_heartbeat_at=now(),last_inventory_at=CASE WHEN $11 THEN $6::timestamptz ELSE last_inventory_at END,budget_source=$8,safe_available_memory_mb=$9,safe_available_disk_gb=$10,resource_measured_at=$12,updated_at=now() WHERE id=$7::uuid`, status, hb.AllocatableCPU, hb.AllocatableMemoryMB, hb.AllocatableDiskGB, facts, inventoryAt, hostID, budgetSource, safeMemory, safeDisk, freshInventory, measured)
@@ -366,6 +369,10 @@ func (s *Service) Heartbeat(ctx context.Context, hostID string, hb Heartbeat) er
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func canonicalMeasurementTime(value time.Time) time.Time {
+	return value.UTC().Truncate(time.Microsecond)
 }
 
 var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)

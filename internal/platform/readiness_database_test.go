@@ -161,6 +161,77 @@ func TestConservativeDomainReconciliationDatabase(t *testing.T) {
 	}
 }
 
+func TestHeartbeatMeasurementPrecisionDatabase(t *testing.T) {
+	s, host, network := reliabilityFixture(t)
+	ctx := context.Background()
+	id := reliabilityInstance(t, s, host, network, "precision-observe", true)
+	base := time.Now().UTC().Truncate(time.Second).Add(2*time.Second + 123456*time.Microsecond)
+	hb := fixtureHeartbeat(s, host, base.Add(700*time.Nanosecond))
+	hb.Domains = nil
+	if err := s.Heartbeat(ctx, host, hb); err != nil {
+		t.Fatal(err)
+	}
+	check := func(want int) {
+		t.Helper()
+		var scans int
+		var stored, lastInventory time.Time
+		var jsonTime string
+		if err := s.DB.QueryRow(ctx, `SELECT domain_missing_scans FROM instances WHERE id=$1::uuid`, id).Scan(&scans); err != nil || scans != want {
+			t.Fatalf("代际计数错误：实际%d预期%d，错误%v", scans, want, err)
+		}
+		if err := s.DB.QueryRow(ctx, `SELECT resource_measured_at,last_inventory_at,facts#>>'{host,resource_measured_at}' FROM hosts WHERE id=$1::uuid`, host).Scan(&stored, &lastInventory, &jsonTime); err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, jsonTime)
+		if err != nil || !parsed.Equal(stored) || stored.Nanosecond()%1000 != 0 || lastInventory.Nanosecond()%1000 != 0 {
+			t.Fatal("JSON、资源与清单时间没有统一到数据库微秒精度", err)
+		}
+	}
+	check(1)
+	// 完全重发及同一微秒内更早/更晚纳秒均只属于同一代扫描。
+	for _, delta := range []time.Duration{700 * time.Nanosecond, 999 * time.Nanosecond, 1 * time.Nanosecond, 0} {
+		hb.Facts.ResourceMeasuredAt = base.Add(delta)
+		if err := s.Heartbeat(ctx, host, hb); err != nil {
+			t.Fatal(err)
+		}
+		check(1)
+	}
+	// 更旧的独立微秒测量不能回退资源、清单或缺失计数。
+	hb.Facts.ResourceMeasuredAt = base.Add(-time.Microsecond)
+	hb.Facts.SafeAvailableMemoryMB = 1
+	if err := s.Heartbeat(ctx, host, hb); err != nil {
+		t.Fatal(err)
+	}
+	check(1)
+	var safe int
+	if err := s.DB.QueryRow(ctx, `SELECT safe_available_memory_mb FROM hosts WHERE id=$1::uuid`, host).Scan(&safe); err != nil || safe != 65536 {
+		t.Fatal("乱序旧测量覆盖了新安全余量", err)
+	}
+	// 真正推进到下一微秒才算第二代；它的纳秒重发仍不重复。
+	hb.Facts.SafeAvailableMemoryMB = 65536
+	hb.Facts.ResourceMeasuredAt = base.Add(time.Microsecond + 200*time.Nanosecond)
+	if err := s.Heartbeat(ctx, host, hb); err != nil {
+		t.Fatal(err)
+	}
+	check(2)
+	hb.Facts.ResourceMeasuredAt = base.Add(time.Microsecond + 900*time.Nanosecond)
+	if err := s.Heartbeat(ctx, host, hb); err != nil {
+		t.Fatal(err)
+	}
+	check(2)
+}
+
+func TestCanonicalMeasurementPrecision(t *testing.T) {
+	value := time.Date(2026, 10, 9, 12, 0, 0, 123456789, time.FixedZone("测试时区", 8*3600))
+	canonical := canonicalMeasurementTime(value)
+	if canonical.Location() != time.UTC || canonical.Nanosecond() != 123456000 || !canonical.Equal(value.Truncate(time.Microsecond)) {
+		t.Fatal("测量时间未正确规范化UTC微秒")
+	}
+	if !canonicalMeasurementTime(time.Time{}).IsZero() {
+		t.Fatal("零值测量丢失兼容语义")
+	}
+}
+
 func TestRemoteImageSyncAndGenerationDatabase(t *testing.T) {
 	s, host, _ := reliabilityFixture(t)
 	ctx := context.Background()

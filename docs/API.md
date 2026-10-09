@@ -1,6 +1,6 @@
 # API 说明
 
-## 服务器分页与资源就绪（0.5.0）
+## 服务器分页与资源就绪（0.5.1）
 
 `GET /users`、`GET /instances`、`GET /approvals`、`GET /ip-addresses`返回 `{items,total,page,page_size}`，默认1页/20条，上限100，越界页夹到最后一页；总数和记录使用同一只读快照。所有支持keyword；users额外role/source/status，instances额外status/host_id/scope=mine，approvals额外status/type/scope=mine，IP必填network_id并支持status。完整枚举和字段见 [资源就绪与服务器分页](资源就绪与服务器分页.md)。普通用户始终限自己的实例/审批，scope=all不能越权。
 
@@ -17,7 +17,7 @@ instances额外返回全授权scope的 `expiring_total`（未来24h，不受分�
 后端 0.4.5 起自动与测试消息均使用 Markdown，发送记录中的 message 为原始 Markdown 文本。配置和接口结构不变，不向群发送敏感凭据。具体样式见 [群通知](群通知.md)。
 
 - `GET /api/v1/notifications/config`：读取规则、打码地址和最近发送结果，不返回明文凭据。
-- `PUT /api/v1/notifications/config`：保存 `enabled`、`webhook_url`、`signature_secret`、`platform_url`、`reminder_hours`、`notify_retained`、`notify_retention_end`、`mention_owner`；0.5.0 增加 `notify_approvals`、`notify_failures`、`notify_host_alerts`，旧客户端省略时保留原值。凭据留空保持不变，`clear_webhook` / `clear_signature_secret` 可清除。提醒时间为 1–168 小时、最多 5 个不重复整数。
+- `PUT /api/v1/notifications/config`：保存 `enabled`、`webhook_url`、`signature_secret`、`platform_url`、`reminder_hours`、`notify_retained`、`notify_retention_end`、`mention_owner`；0.5.1 增加 `notify_approvals`、`notify_failures`、`notify_host_alerts`，旧客户端省略时保留原值。凭据留空保持不变，`clear_webhook` / `clear_signature_secret` 可清除。提醒时间为 1–168 小时、最多 5 个不重复整数。
 - `POST /api/v1/notifications/test`：向已保存机器人发送测试消息，自动通知关闭时仍可测试，至少间隔 3 秒；成功后须到群确认收件。
 - `GET /api/v1/notifications/events?page=1&status=SENT`：每页 20 条，支持 `PENDING`、`SENT`、`FAILED`、`CANCELLED` 筛选。
 
@@ -73,7 +73,7 @@ curl -sS -b /受限路径/session.cookies \
 - `POST /api/v1/approvals/batch-decision`：管理员批量批准或拒绝最多 50 个审批单，逐条返回执行结果。
 - `POST /api/v1/approvals/{id}/withdraw`：申请人撤回仍为待审批的申请。
 - `POST /api/v1/approvals/{id}/resubmit-short`：被拒绝、超时、执行失败或主动撤回后，申请人改为不超过 168 小时的短租期并立即执行。
-- `POST /api/v1/instances/{id}/console-sessions`：请求 `mode=vnc|serial`，仅实例所有者或管理员可用。返回同源平台 WebSocket 地址和 5 分钟有效的一次性票据；0.5.0 基于实际存在的授权托管域提供创建中/错误现场救援，不接管外部域，不绕过到期/保留/删除限制。
+- `POST /api/v1/instances/{id}/console-sessions`：请求 `mode=vnc|serial`，仅实例所有者或管理员可用。返回同源平台 WebSocket 地址和 5 分钟有效的一次性票据；0.5.1 基于实际存在的授权托管域提供创建中/错误现场救援，不接管外部域，不绕过到期/保留/删除限制。
 - `POST /api/v1/agents/{id}/console-sessions/{sessionID}/consume`：Agent 使用运行令牌原子核销一次性票据，仅供内部调用。
 - `GET /api/v1/audit-logs`：管理员查询平台操作流水，支持 `keyword`、`action`、`resource_type`、`outcome`、`scope`、`from`、`to`、`page`和 `page_size`，并返回动态动作与资源类型选项。
 
@@ -99,7 +99,7 @@ curl -sS -b /受限路径/session.cookies \
 
 Agent 在创建磁盘/定义域前结合 ARP 与 ICMP 探测候选 IP，占用时返回 `error_code=IP_ADDRESS_IN_USE`。控制面隔离冲突地址、预留下一个空闲地址并更新任务。池耗尽会明确失败；管理员扩容后重试会补齐 IP 关系。Guest Agent、目标 MAC 和网络可用性分层报告交付，单独 ping 超时不删现场。详细能力与限制见 [P2 功能与验收](P2功能与验收.md)。
 
-## 治理接口（0.5.0）
+## 治理接口（0.5.1）
 
 - `GET/PUT /api/v1/platform-policy`：仅管理员。字段 `max_instances/max_cpu/max_memory_mb/max_disk_gb/max_future_lease_hours/max_continuous_lease_hours` 的 0 表示不限；`auto_renew_enabled` 默认 false，`auto_renew_hours` 为 1–168、`auto_renew_max_count` 为 1–100；`audit_retention_days/notification_retention_days/approval_retention_days` 为 0 永久，非零至少 180/30/90 天。
 - `GET/PUT /api/v1/instances/{id}/auto-renew`：所有者或管理员。保存 `{enabled,hours,max_renewals}`，响应含成功次数、停止原因及平台是否开启、最大小时/次数；重新开关不重置次数。到期前一小时检查，不对已到期实例自动恢复。
