@@ -34,7 +34,7 @@ jobs:
       - name: 安装 Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: "1.27.2"
           cache: true
       - name: 初始化专用测试数据库扩展
         # 多包测试各自建临时 schema，扩展必须在公共测试 schema，不能随某一测试清理。
@@ -43,3 +43,5 @@ jobs:
         run: go test -race -count=1 ./...
       - name: 静态检查
         run: go vet ./...
+      - name: 已知漏洞检查
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...

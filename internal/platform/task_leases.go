@@ -41,6 +41,9 @@ func (s *Service) RecoverTaskLeases(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := LockResourceReadiness(ctx, tx); err != nil {
+		return err
+	}
 	rows, err := tx.Query(ctx, `SELECT id::text,resource_id::text,task_type,attempt,max_attempts FROM tasks WHERE status='RUNNING' AND lease_until<=now() ORDER BY lease_until FOR UPDATE SKIP LOCKED LIMIT 50`)
 	if err != nil {
 		return err
@@ -70,6 +73,12 @@ func (s *Service) RecoverTaskLeases(ctx context.Context) error {
 			message = "任务租约过期且结果不确定，请核查实例实际状态后再操作"
 			if _, err = tx.Exec(ctx, `UPDATE tasks SET status='FAILED',error_message=$1,completed_at=now(),lease_until=NULL,updated_at=now() WHERE id=$2::uuid`, message, task.id); err != nil {
 				return err
+			}
+			if task.taskType == "SYNC_IMAGE" {
+				if err = s.applyImageSyncResultTx(ctx, tx, task.id, task.resourceID, TaskResult{Error: message}); err != nil {
+					return err
+				}
+				continue
 			}
 			if _, err = tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,updated_at=now() WHERE id=$2::uuid`, terminalFailureStatus(task.taskType), task.resourceID); err != nil {
 				return err

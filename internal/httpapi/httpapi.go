@@ -11,7 +11,6 @@ import (
 	"net/netip"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +31,7 @@ type API struct {
 
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
+	a.registerGovernanceRoutes(mux)
 	mux.HandleFunc("GET /api/v1/health", a.health)
 	mux.HandleFunc("POST /api/v1/auth/login", a.authLogin)
 	mux.HandleFunc("POST /api/v1/auth/logout", a.authLogout)
@@ -65,6 +65,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/images", a.createImage)
 	mux.HandleFunc("PATCH /api/v1/images/{id}", a.updateImage)
 	mux.HandleFunc("DELETE /api/v1/images/{id}", a.deleteImage)
+	mux.HandleFunc("POST /api/v1/images/{id}/sync", a.syncImage)
 	mux.HandleFunc("GET /api/v1/networks", a.networks)
 	mux.HandleFunc("POST /api/v1/networks", a.createNetwork)
 	mux.HandleFunc("PATCH /api/v1/networks/{id}", a.updateNetwork)
@@ -88,6 +89,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/tasks", a.tasks)
 	mux.HandleFunc("GET /api/v1/audit-logs", a.auditLogs)
 	mux.HandleFunc("POST /api/v1/agents/register", a.registerAgent)
+	mux.HandleFunc("GET /api/v1/agents/{id}/catalog", a.agentCatalog)
 	mux.HandleFunc("POST /api/v1/agents/{id}/heartbeat", a.agentHeartbeat)
 	mux.HandleFunc("POST /api/v1/agents/{id}/console-sessions/{sessionID}/consume", a.consumeConsoleSession)
 	mux.HandleFunc("GET /api/v1/agents/{id}/tasks/next", a.agentTask)
@@ -141,15 +143,19 @@ func (a *API) hosts(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("all") == "1" {
 		filter = ""
 	}
-	a.queryList(w, r, `SELECT jsonb_build_object('id',h.id,'name',h.name,'provider_type',h.provider_type,'agent_mode',h.agent_mode,'status',h.status,'management_ip',h.management_ip,'allocatable_cpu',h.allocatable_cpu,'allocatable_memory_mb',h.allocatable_memory_mb,'allocatable_disk_gb',h.allocatable_disk_gb,'agent_allocatable_cpu',h.agent_allocatable_cpu,'agent_allocatable_memory_mb',h.agent_allocatable_memory_mb,'agent_allocatable_disk_gb',h.agent_allocatable_disk_gb,'quota_cpu',h.quota_cpu,'quota_memory_mb',h.quota_memory_mb,'quota_disk_gb',h.quota_disk_gb,'reserved_cpu',h.reserved_cpu,'reserved_memory_mb',h.reserved_memory_mb,'reserved_disk_gb',h.reserved_disk_gb,'last_heartbeat_at',h.last_heartbeat_at,'last_inventory_at',h.last_inventory_at,'facts',h.facts,'discovered_instances',(SELECT count(*) FROM discovered_instances d WHERE d.host_id=h.id),'external_instances',(SELECT count(*) FROM discovered_instances d WHERE d.host_id=h.id AND d.ownership='EXTERNAL')) FROM hosts h`+filter+` ORDER BY h.name`)
+	a.queryList(w, r, `SELECT jsonb_build_object('id',h.id,'name',h.name,'provider_type',h.provider_type,'agent_mode',h.agent_mode,'status',h.status,'management_ip',h.management_ip,'allocatable_cpu',h.allocatable_cpu,'allocatable_memory_mb',h.allocatable_memory_mb,'allocatable_disk_gb',h.allocatable_disk_gb,'agent_allocatable_cpu',h.agent_allocatable_cpu,'agent_allocatable_memory_mb',h.agent_allocatable_memory_mb,'agent_allocatable_disk_gb',h.agent_allocatable_disk_gb,'quota_cpu',h.quota_cpu,'quota_memory_mb',h.quota_memory_mb,'quota_disk_gb',h.quota_disk_gb,'reserved_cpu',h.reserved_cpu,'reserved_memory_mb',h.reserved_memory_mb,'reserved_disk_gb',h.reserved_disk_gb,'last_heartbeat_at',h.last_heartbeat_at,'last_inventory_at',h.last_inventory_at,'facts',h.facts,'discovered_instances',(SELECT count(*) FROM discovered_instances d WHERE d.host_id=h.id),'external_instances',(SELECT count(*) FROM discovered_instances d WHERE d.host_id=h.id AND d.ownership='EXTERNAL'),'budget_source',h.budget_source,'safe_available_memory_mb',h.safe_available_memory_mb,'safe_available_disk_gb',h.safe_available_disk_gb,'resource_measured_at',h.resource_measured_at) FROM hosts h`+filter+` ORDER BY h.name`)
 }
 func (a *API) flavors(w http.ResponseWriter, r *http.Request) {
 	user, _ := userFromRequest(r)
-	filter := " WHERE enabled"
+	filter := " WHERE f.enabled"
 	if user.Role == "ADMIN" && r.URL.Query().Get("all") == "1" {
 		filter = ""
 	}
-	a.queryList(w, r, `SELECT jsonb_build_object('id',id,'name',name,'cpu',cpu,'memory_mb',memory_mb,'disk_gb',disk_gb,'enabled',enabled) FROM flavors`+filter+` ORDER BY cpu`)
+	if user.Role != "ADMIN" {
+		a.queryList(w, r, `SELECT jsonb_build_object('id',f.id,'name',f.name,'cpu',f.cpu,'memory_mb',f.memory_mb,'disk_gb',f.disk_gb,'enabled',f.enabled) FROM flavors f`+filter+` ORDER BY f.cpu,f.id`)
+		return
+	}
+	a.queryList(w, r, `SELECT jsonb_build_object('id',f.id,'name',f.name,'cpu',f.cpu,'memory_mb',f.memory_mb,'disk_gb',f.disk_gb,'enabled',f.enabled,'usage',(SELECT jsonb_build_object('running',count(*) FILTER(WHERE i.lifecycle_status='RUNNING'),'retained',count(*) FILTER(WHERE i.lifecycle_status='RETAINED'),'active',count(*),'memory_mb',coalesce(sum(i.allocated_memory_mb),0),'disk_gb',coalesce(sum(i.allocated_disk_gb),0),'percent',coalesce(round(100.0*sum(i.allocated_memory_mb)/nullif((SELECT sum(h.allocatable_memory_mb) FROM hosts h WHERE h.agent_mode<>'mock'),0),2),0)) FROM instances i JOIN applications ap ON ap.id=i.application_id WHERE ap.flavor_id=f.id AND i.lifecycle_status<>'RELEASED')) FROM flavors f`+filter+` ORDER BY f.cpu,f.id`)
 }
 func (a *API) images(w http.ResponseWriter, r *http.Request) {
 	user, _ := userFromRequest(r)
@@ -161,24 +167,13 @@ func (a *API) images(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("all") == "1" {
 		filter = ""
 	}
-	a.queryList(w, r, `SELECT jsonb_build_object('id',id,'name',name,'file_name',file_name,'source_type',source_type,'source_location',source_location,'checksum',checksum,'sync_status',sync_status,'os_family',os_family,'version',version,'enabled',enabled) FROM images`+filter+` ORDER BY name`)
+	a.queryList(w, r, `SELECT jsonb_build_object('id',images.id,'name',name,'file_name',file_name,'source_type',source_type,'source_location',source_location,'checksum',checksum,'sync_status',sync_status,'os_family',os_family,'version',version,'enabled',enabled,'desired_enabled',desired_enabled,'generation',generation,'host_readiness',coalesce((SELECT jsonb_agg(jsonb_build_object('host_id',hi.host_id,'host_name',h.name,'status',CASE WHEN hi.generation<>images.generation OR hi.reported_at<now()-interval '120 seconds' THEN 'STALE' ELSE hi.status END,'error',hi.error,'verified_at',hi.verified_at,'generation',hi.generation) ORDER BY h.name) FROM host_images hi JOIN hosts h ON h.id=hi.host_id WHERE hi.image_id=images.id),'[]'::jsonb)) FROM images`+filter+` ORDER BY name,id`)
 }
 func (a *API) applications(w http.ResponseWriter, r *http.Request) {
 	a.queryList(w, r, `SELECT jsonb_build_object('id',a.id,'request_no',a.request_no,'applicant',a.applicant,'instance_name',a.instance_name,'purpose',a.purpose,'flavor',f.name,'image',i.name,'lease_hours',a.lease_hours,'status',a.status,'created_at',a.created_at) FROM applications a JOIN flavors f ON f.id=a.flavor_id JOIN images i ON i.id=a.image_id ORDER BY a.created_at DESC`)
 }
 func (a *API) instances(w http.ResponseWriter, r *http.Request) {
-	user, _ := userFromRequest(r)
-	filters := []string{"i.lifecycle_status<>'RELEASED'"}
-	args := []any{}
-	if r.URL.Query().Get("all") != "1" {
-		filters = append(filters, "h.agent_mode<>'mock'")
-	}
-	if user.Role != "ADMIN" || r.URL.Query().Get("scope") == "mine" {
-		filters = append(filters, "a.applicant=$1")
-		args = append(args, user.Username)
-	}
-	where := " WHERE " + strings.Join(filters, " AND ")
-	a.queryListArgs(w, r, `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'host',h.name,'flavor',i.flavor_name_snapshot,'flavor_id',a.flavor_id,'resource_snapshot',jsonb_build_object('cpu',i.allocated_cpu,'memory_mb',i.allocated_memory_mb,'disk_gb',i.allocated_disk_gb),'image',im.name,'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'restore_count',i.restore_count,'created_at',i.created_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id`+where+` ORDER BY i.created_at DESC`, args...)
+	a.instancesPage(w, r)
 }
 
 func (a *API) instanceDetail(w http.ResponseWriter, r *http.Request) {
@@ -189,6 +184,26 @@ func (a *API) instanceDetail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "instance not found")
 		return
 	}
+	var extra json.RawMessage
+	err = a.Service.DB.QueryRow(r.Context(), `SELECT jsonb_build_object('delivery_status',i.delivery_status,'delivery_message',i.delivery_message,'observed_domain_status',i.observed_domain_status,'last_domain_seen_at',i.last_domain_seen_at,'network_id',i.network_id,'console_available',i.expires_at>now() AND i.lifecycle_status IN ('RUNNING','PROVISIONING','ERROR','STOPPED') AND EXISTS(SELECT 1 FROM discovered_instances d WHERE d.host_id=i.host_id AND d.platform_instance_id=i.id AND d.name=i.name AND d.ownership='MANAGED' AND (i.provider_ref IS NULL OR i.provider_ref=d.provider_uuid) AND d.last_seen_at>now()-interval '120 seconds' AND lower(replace(d.state,' ','_')) IN ('running','paused','blocked','pmsuspended'))) FROM instances i JOIN applications ap ON ap.id=i.application_id WHERE i.id=$1::uuid AND ($3 OR ap.applicant=$2)`, r.PathValue("id"), user.Username, user.Role == "ADMIN").Scan(&extra)
+	if err != nil {
+		writeError(w, 404, "实例已变化，请刷新")
+		return
+	}
+	var fields, more map[string]any
+	if json.Unmarshal(instance, &fields) != nil || json.Unmarshal(extra, &more) != nil {
+		writeError(w, 500, "实例详情数据无效")
+		return
+	}
+	for key, value := range more {
+		fields[key] = value
+	}
+	if user.Role != "ADMIN" {
+		if image, ok := fields["image"].(map[string]any); ok {
+			delete(image, "source_location")
+		}
+	}
+	instance, _ = json.Marshal(fields)
 	tasks, err := queryRawList(r, a.Service.DB, `SELECT jsonb_build_object('id',id,'task_type',task_type,'status',status,'attempt',attempt,'max_attempts',max_attempts,'error_message',error_message,'created_at',created_at,'completed_at',completed_at) FROM tasks WHERE resource_id=$1::uuid ORDER BY created_at DESC`, r.PathValue("id"))
 	if err != nil {
 		writeError(w, 500, err.Error())
@@ -581,12 +596,7 @@ func (a *API) deleteIPRange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) ipAddresses(w http.ResponseWriter, r *http.Request) {
-	networkID := r.URL.Query().Get("network_id")
-	if networkID == "" {
-		writeError(w, 400, "network_id is required")
-		return
-	}
-	a.queryListArgs(w, r, `SELECT jsonb_build_object('id',ip.id,'address',ip.address,'status',ip.status,'instance_id',ip.instance_id,'instance_name',i.name,'updated_at',ip.updated_at) FROM ip_addresses ip LEFT JOIN instances i ON i.id=ip.instance_id WHERE ip.network_id=$1::uuid ORDER BY ip.address LIMIT 512`, networkID)
+	a.ipAddressesPage(w, r)
 }
 
 func (a *API) hostStatus(w http.ResponseWriter, r *http.Request) {
@@ -761,7 +771,11 @@ func (a *API) createImage(w http.ResponseWriter, r *http.Request) {
 		in.SourceType = "local"
 	}
 	syncStatus := "READY"
-	enabled := true
+	desired := true
+	if in.Enabled != nil {
+		desired = *in.Enabled
+	}
+	enabled := desired
 	if in.SourceType == "local" {
 		if !imageFileNamePattern.MatchString(in.FileName) {
 			writeError(w, 422, "local image requires a safe file_name")
@@ -772,8 +786,8 @@ func (a *API) createImage(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if in.SourceType == "remote" {
 		remoteURL, err := url.ParseRequestURI(in.SourceLocation)
-		if err != nil || (remoteURL.Scheme != "http" && remoteURL.Scheme != "https") || remoteURL.Host == "" || !regexp.MustCompile(`^[a-fA-F0-9]{64}$`).MatchString(in.Checksum) {
-			writeError(w, 422, "remote image requires an HTTP(S) URL and SHA-256 checksum")
+		if err != nil || remoteURL.Scheme != "https" || remoteURL.Host == "" || remoteURL.User != nil || !regexp.MustCompile(`^[a-fA-F0-9]{64}$`).MatchString(in.Checksum) {
+			writeError(w, 422, "远程镜像需要HTTPS地址和SHA-256摘要；禁止地址中嵌入用户名密码")
 			return
 		}
 		if in.FileName == "" {
@@ -789,7 +803,7 @@ func (a *API) createImage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 422, "source_type must be local or remote")
 		return
 	}
-	_, err := a.Service.DB.Exec(r.Context(), `INSERT INTO images(id,name,file_name,source_type,source_location,checksum,sync_status,os_family,version,enabled) VALUES($1,$2,$3,$4,$5,nullif($6,''),$7,$8,$9,$10)`, in.ID, in.Name, in.FileName, in.SourceType, in.SourceLocation, in.Checksum, syncStatus, in.OSFamily, in.Version, enabled)
+	_, err := a.Service.DB.Exec(r.Context(), `INSERT INTO images(id,name,file_name,source_type,source_location,checksum,sync_status,os_family,version,enabled,desired_enabled) VALUES($1,$2,$3,$4,$5,nullif($6,''),$7,$8,$9,$10,$11)`, in.ID, in.Name, in.FileName, in.SourceType, in.SourceLocation, strings.ToLower(in.Checksum), syncStatus, in.OSFamily, in.Version, enabled, desired)
 	if err != nil {
 		writeError(w, 409, err.Error())
 		return
@@ -820,8 +834,8 @@ func (a *API) updateImage(w http.ResponseWriter, r *http.Request) {
 			in.Checksum = ""
 		} else if in.SourceType == "remote" {
 			remoteURL, err := url.ParseRequestURI(in.SourceLocation)
-			if err != nil || (remoteURL.Scheme != "http" && remoteURL.Scheme != "https") || remoteURL.Host == "" || !regexp.MustCompile(`^[a-fA-F0-9]{64}$`).MatchString(in.Checksum) {
-				writeError(w, 422, "remote image requires an HTTP(S) URL and SHA-256 checksum")
+			if err != nil || remoteURL.Scheme != "https" || remoteURL.Host == "" || remoteURL.User != nil || !regexp.MustCompile(`^[a-fA-F0-9]{64}$`).MatchString(in.Checksum) {
+				writeError(w, 422, "远程镜像需要HTTPS地址和SHA-256摘要；禁止地址中嵌入用户名密码")
 				return
 			}
 			syncStatus = "PENDING"
@@ -830,7 +844,23 @@ func (a *API) updateImage(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 422, "source_type must be local or remote")
 			return
 		}
-		tag, err := a.Service.DB.Exec(r.Context(), `UPDATE images SET name=$1,file_name=$2,source_type=$3,source_location=$4,checksum=nullif($5,''),sync_status=$6,os_family=$7,version=$8,enabled=$9 WHERE id=$10`, in.Name, in.FileName, in.SourceType, in.SourceLocation, in.Checksum, syncStatus, in.OSFamily, in.Version, enabled, r.PathValue("id"))
+		tx, err := a.Service.DB.Begin(r.Context())
+		if err != nil {
+			writeError(w, 503, "镜像管理暂不可用")
+			return
+		}
+		defer tx.Rollback(r.Context())
+		if err := platform.LockResourceReadiness(r.Context(), tx); err != nil {
+			writeError(w, 503, "镜像就绪服务暂不可用")
+			return
+		}
+		var oldFile, oldType, oldLocation, oldChecksum string
+		if err := tx.QueryRow(r.Context(), `SELECT file_name,source_type,coalesce(source_location,''),coalesce(checksum,'') FROM images WHERE id=$1 FOR UPDATE`, r.PathValue("id")).Scan(&oldFile, &oldType, &oldLocation, &oldChecksum); err != nil {
+			writeError(w, 404, "镜像不存在")
+			return
+		}
+		changed := oldFile != in.FileName || oldType != in.SourceType || oldLocation != in.SourceLocation || !strings.EqualFold(oldChecksum, in.Checksum)
+		tag, err := tx.Exec(r.Context(), `UPDATE images SET name=$1,file_name=$2,source_type=$3,source_location=$4,checksum=nullif($5,''),sync_status=CASE WHEN $11 THEN $6 ELSE sync_status END,os_family=$7,version=$8,enabled=$9,desired_enabled=$12,generation=generation+CASE WHEN $11 THEN 1 ELSE 0 END WHERE id=$10`, in.Name, in.FileName, in.SourceType, in.SourceLocation, strings.ToLower(in.Checksum), syncStatus, in.OSFamily, in.Version, enabled, r.PathValue("id"), changed, *in.Enabled)
 		if err != nil {
 			writeError(w, 422, err.Error())
 			return
@@ -839,10 +869,28 @@ func (a *API) updateImage(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 404, "image was not found")
 			return
 		}
-		writeJSON(w, 200, map[string]any{"enabled": enabled, "sync_status": syncStatus})
+		if changed {
+			if _, err := tx.Exec(r.Context(), `UPDATE host_images SET status='STALE',error='镜像定义已变更，需要重新同步或探测',verified_at=NULL WHERE image_id=$1`, r.PathValue("id")); err != nil {
+				writeError(w, 500, "镜像就绪记录更新失败")
+				return
+			}
+		}
+		if _, err := tx.Exec(r.Context(), `UPDATE images SET enabled=desired_enabled AND (source_type='local' OR sync_status='READY') WHERE id=$1`, r.PathValue("id")); err != nil {
+			writeError(w, 500, "保存镜像状态失败")
+			return
+		}
+		if err := tx.QueryRow(r.Context(), `SELECT enabled,sync_status FROM images WHERE id=$1`, r.PathValue("id")).Scan(&enabled, &syncStatus); err != nil {
+			writeError(w, 500, "读取镜像更新结果失败")
+			return
+		}
+		if err := tx.Commit(r.Context()); err != nil {
+			writeError(w, 503, "镜像更新未完成，请重试")
+			return
+		}
+		writeJSON(w, 200, map[string]any{"enabled": enabled, "sync_status": syncStatus, "definition_changed": changed})
 		return
 	}
-	tag, err := a.Service.DB.Exec(r.Context(), `UPDATE images SET enabled=$1 WHERE id=$2 AND sync_status='READY'`, *in.Enabled, r.PathValue("id"))
+	tag, err := a.Service.DB.Exec(r.Context(), `UPDATE images SET desired_enabled=$1,enabled=$1 AND (source_type='local' OR sync_status='READY') WHERE id=$2`, *in.Enabled, r.PathValue("id"))
 	if err != nil {
 		writeError(w, 422, err.Error())
 		return
@@ -859,13 +907,27 @@ func (a *API) deleteImage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 422, "镜像标识仅支持字母、数字、点、下划线和连字符，最多 64 字符")
 		return
 	}
-	tag, err := a.Service.DB.Exec(r.Context(), `DELETE FROM images i WHERE i.id=$1 AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.image_id=i.id)`, r.PathValue("id"))
+	tx, err := a.Service.DB.Begin(r.Context())
+	if err != nil {
+		writeError(w, 503, "镜像管理暂不可用")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if err := platform.LockResourceReadiness(r.Context(), tx); err != nil {
+		writeError(w, 503, "镜像就绪服务暂不可用")
+		return
+	}
+	tag, err := tx.Exec(r.Context(), `DELETE FROM images i WHERE i.id=$1 AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.image_id=i.id)`, r.PathValue("id"))
 	if err != nil {
 		writeError(w, 409, err.Error())
 		return
 	}
 	if tag.RowsAffected() == 0 {
 		writeError(w, 409, "镜像不存在或已被申请记录引用；已使用的镜像只能停用")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, 503, "删除镜像未完成，请重试")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": r.PathValue("id"), "deleted": true})
@@ -940,19 +1002,7 @@ func (a *API) restoreInstance(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) approvals(w http.ResponseWriter, r *http.Request) {
-	user, _ := userFromRequest(r)
-	conditions := []string{"true"}
-	args := make([]any, 0)
-	if user.Role != "ADMIN" || r.URL.Query().Get("scope") == "mine" {
-		args = append(args, user.Username)
-		conditions = append(conditions, "ar.applicant=$1")
-	}
-	if requestedStatus := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("status"))); requestedStatus != "" {
-		args = append(args, requestedStatus)
-		conditions = append(conditions, "ar.status=$"+strconv.Itoa(len(args)))
-	}
-	query := `SELECT jsonb_build_object('id',ar.id,'request_no',ar.request_no,'request_type',ar.request_type,'applicant',ar.applicant,'instance_id',ar.instance_id,'instance_name',coalesce(i.name,ar.payload->>'instance_name','-'),'requested_hours',ar.requested_hours,'reason',ar.reason,'status',ar.status,'reviewer',ar.reviewer,'review_comment',ar.review_comment,'result',ar.result,'created_at',ar.created_at,'expires_at',ar.expires_at,'reviewed_at',ar.reviewed_at) FROM approval_requests ar LEFT JOIN instances i ON i.id=ar.instance_id WHERE ` + strings.Join(conditions, " AND ") + ` ORDER BY CASE ar.status WHEN 'PENDING' THEN 0 WHEN 'PROCESSING' THEN 1 ELSE 2 END,ar.created_at DESC`
-	a.queryListArgs(w, r, query, args...)
+	a.approvalsPage(w, r)
 }
 
 func (a *API) decideApproval(w http.ResponseWriter, r *http.Request) {

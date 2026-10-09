@@ -44,13 +44,15 @@ func (a *API) createConsoleSession(w http.ResponseWriter, r *http.Request) {
 	}
 	user, _ := userFromRequest(r)
 	var name, lifecycleStatus, hostID, consoleURL string
-	err := a.Service.DB.QueryRow(r.Context(), `SELECT i.name,i.lifecycle_status,h.id::text,coalesce(h.facts#>>'{host,console_url}','') FROM instances i JOIN applications ap ON ap.id=i.application_id JOIN hosts h ON h.id=i.host_id WHERE i.id=$1::uuid AND ($3 OR ap.applicant=$2)`, r.PathValue("id"), user.Username, user.Role == "ADMIN").Scan(&name, &lifecycleStatus, &hostID, &consoleURL)
+	var leaseEnd time.Time
+	var actualDomain bool
+	err := a.Service.DB.QueryRow(r.Context(), `SELECT i.name,i.lifecycle_status,h.id::text,coalesce(h.facts#>>'{host,console_url}',''),i.expires_at,EXISTS(SELECT 1 FROM discovered_instances d WHERE d.host_id=i.host_id AND d.platform_instance_id=i.id AND d.name=i.name AND d.ownership='MANAGED' AND (i.provider_ref IS NULL OR i.provider_ref=d.provider_uuid) AND d.last_seen_at>now()-interval '120 seconds' AND lower(replace(d.state,' ','_')) IN ('running','paused','blocked','pmsuspended')) FROM instances i JOIN applications ap ON ap.id=i.application_id JOIN hosts h ON h.id=i.host_id WHERE i.id=$1::uuid AND ($3 OR ap.applicant=$2)`, r.PathValue("id"), user.Username, user.Role == "ADMIN").Scan(&name, &lifecycleStatus, &hostID, &consoleURL, &leaseEnd, &actualDomain)
 	if err != nil {
 		writeError(w, 404, "实例不存在")
 		return
 	}
-	if lifecycleStatus != "RUNNING" {
-		writeError(w, 409, "只有运行中的实例可以打开控制台")
+	if !actualDomain || !leaseEnd.After(time.Now()) || (lifecycleStatus != "RUNNING" && lifecycleStatus != "PROVISIONING" && lifecycleStatus != "ERROR" && lifecycleStatus != "STOPPED") {
+		writeError(w, 409, "没有新鲜确认的可用托管域，或实例已到期/正在释放；控制台不会自动开机或重建")
 		return
 	}
 	endpoint, err := url.Parse(consoleURL)
@@ -65,6 +67,9 @@ func (a *API) createConsoleSession(w http.ResponseWriter, r *http.Request) {
 	}
 	// 五分钟用于覆盖弹窗放行和人工操作延迟；真正的安全边界由服务端一次性核销保证。
 	expiresAt := time.Now().Add(5 * time.Minute)
+	if leaseEnd.Before(expiresAt) {
+		expiresAt = leaseEnd
+	}
 	ticket := consoleTicket{SessionID: base64.RawURLEncoding.EncodeToString(sessionBytes), HostID: hostID, Instance: r.PathValue("id"), Domain: name, Mode: input.Mode, Actor: user.Username, ExpiresAt: expiresAt.Unix()}
 	_, _ = a.Service.DB.Exec(r.Context(), `DELETE FROM console_sessions WHERE expires_at<now()-interval '1 day'`)
 	if _, err := a.Service.DB.Exec(r.Context(), `INSERT INTO console_sessions(id,host_id,instance_id,domain,mode,actor,expires_at) VALUES($1,$2::uuid,$3::uuid,$4,$5,$6,$7)`, ticket.SessionID, hostID, ticket.Instance, ticket.Domain, ticket.Mode, ticket.Actor, expiresAt); err != nil {
@@ -77,12 +82,10 @@ func (a *API) createConsoleSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/api/v1/console/" + input.Mode
-	values := endpoint.Query()
+	values := url.Values{}
 	values.Set("ticket", signed)
-	endpoint.RawQuery = values.Encode()
 	a.recordAudit(r.Context(), r, user.Username, "instance.console.open", "instance", r.PathValue("id"), "SUCCESS", map[string]any{"mode": input.Mode, "session_id": ticket.SessionID, "expires_at": expiresAt})
-	writeJSON(w, 201, map[string]any{"session_id": ticket.SessionID, "mode": input.Mode, "websocket_url": endpoint.String(), "expires_at": expiresAt})
+	writeJSON(w, 201, map[string]any{"session_id": ticket.SessionID, "mode": input.Mode, "websocket_url": "/api/v1/console/" + input.Mode + "?" + values.Encode(), "expires_at": expiresAt, "diagnostic": lifecycleStatus != "RUNNING"})
 }
 
 // consumeConsoleSession 由目标宿主机 Agent 在 WebSocket 升级前调用，原子核销一次性票据。
@@ -99,7 +102,7 @@ func (a *API) consumeConsoleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var sessionID string
-	err := a.Service.DB.QueryRow(r.Context(), `UPDATE console_sessions SET used_at=now() WHERE id=$1 AND host_id=$2::uuid AND mode=$3 AND domain=$4 AND used_at IS NULL AND expires_at>now() RETURNING id`, r.PathValue("sessionID"), r.PathValue("id"), input.Mode, input.Domain).Scan(&sessionID)
+	err := a.Service.DB.QueryRow(r.Context(), `UPDATE console_sessions s SET used_at=now() WHERE s.id=$1 AND s.host_id=$2::uuid AND s.mode=$3 AND s.domain=$4 AND s.used_at IS NULL AND s.expires_at>now() AND EXISTS(SELECT 1 FROM instances i WHERE i.id=s.instance_id AND i.host_id=s.host_id AND i.expires_at>now() AND i.lifecycle_status IN ('RUNNING','PROVISIONING','ERROR','STOPPED') AND EXISTS(SELECT 1 FROM discovered_instances d WHERE d.host_id=i.host_id AND d.platform_instance_id=i.id AND d.name=i.name AND d.ownership='MANAGED' AND d.last_seen_at>now()-interval '120 seconds' AND (i.provider_ref IS NULL OR i.provider_ref=d.provider_uuid) AND lower(replace(d.state,' ','_')) IN ('running','paused','blocked','pmsuspended'))) RETURNING s.id`, r.PathValue("sessionID"), r.PathValue("id"), input.Mode, input.Domain).Scan(&sessionID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, 409, "控制台票据已使用或已过期")
 		return

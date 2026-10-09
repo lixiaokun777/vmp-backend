@@ -94,6 +94,19 @@ func reliabilityFixture(t *testing.T) (*Service, string, string) {
 	if _, err := pool.Exec(ctx, `INSERT INTO ip_addresses(network_id,address) SELECT $1::uuid,('10.88.0.'||n)::inet FROM generate_series(10,30) n`, network); err != nil {
 		t.Fatal(err)
 	}
+	for _, query := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO users(username,role,source,password_hash) VALUES('isolated-user','USER','LOCAL',crypt('FixtureStrong123!',gen_salt('bf',4)))`, nil},
+		{`UPDATE hosts SET budget_source='CONFIGURED_TOTAL',safe_available_memory_mb=65536,safe_available_disk_gb=1000,resource_measured_at=now(),last_inventory_at=now(),last_heartbeat_at=now() WHERE id=$1::uuid`, []any{host}},
+		{`INSERT INTO host_images(host_id,image_id,generation,file_name,checksum,status,verified_at) SELECT $1::uuid,id,generation,file_name,repeat('a',64),'READY',now() FROM images WHERE id='ubuntu-2204'`, []any{host}},
+		{`INSERT INTO host_networks(host_id,network_id,bridge,ready) VALUES($1::uuid,$2::uuid,'br0',true)`, []any{host, network}},
+	} {
+		if _, err := pool.Exec(ctx, query.sql, query.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return &Service{DB: pool}, host, network
 }
 
@@ -113,7 +126,7 @@ func reliabilityInstance(t *testing.T, s *Service, host, network, name string, r
 		if err := s.DB.QueryRow(context.Background(), `SELECT host(ip_address) FROM instances WHERE id=$1::uuid`, id).Scan(&ip); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.CompleteTask(context.Background(), host, task["id"].(string), TaskResult{ClaimToken: task["claim_token"].(string), Success: true, IPAddress: ip, ProviderRef: "isolated-domain"}); err != nil {
+		if err := s.CompleteTask(context.Background(), host, task["id"].(string), TaskResult{ClaimToken: task["claim_token"].(string), Success: true, IPAddress: ip, ProviderRef: "isolated-domain", DeliveryStatus: "READY"}); err != nil {
 			t.Fatal(err)
 		}
 	}

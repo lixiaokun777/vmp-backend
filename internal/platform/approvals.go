@@ -108,9 +108,13 @@ func (s *Service) submitInstanceApproval(ctx context.Context, actor string, admi
 }
 
 func (s *Service) insertApproval(ctx context.Context, actor, requestType, instanceID string, hours int, reason string, payload []byte) (map[string]any, error) {
+	reviewer, delegatedFrom, err := assignApproval(ctx, s.DB)
+	if err != nil {
+		return nil, err
+	}
 	var id, requestNo string
 	var expiresAt time.Time
-	err := s.DB.QueryRow(ctx, `INSERT INTO approval_requests(request_no,request_type,applicant,instance_id,requested_hours,reason,payload) VALUES('APR-'||to_char(now(),'YYYYMMDD')||'-'||upper(substr(replace(gen_random_uuid()::text,'-',''),1,6)),$1,$2,nullif($3,'')::uuid,$4,$5,$6) RETURNING id::text,request_no,expires_at`, requestType, actor, instanceID, hours, reason, payload).Scan(&id, &requestNo, &expiresAt)
+	err = s.DB.QueryRow(ctx, `INSERT INTO approval_requests(request_no,request_type,applicant,instance_id,requested_hours,reason,payload,assigned_reviewer,delegated_from) VALUES('APR-'||to_char(now(),'YYYYMMDD')||'-'||upper(substr(replace(gen_random_uuid()::text,'-',''),1,6)),$1,$2,nullif($3,'')::uuid,$4,$5,$6,nullif($7,''),nullif($8,'')) RETURNING id::text,request_no,expires_at`, requestType, actor, instanceID, hours, reason, payload, reviewer, delegatedFrom).Scan(&id, &requestNo, &expiresAt)
 	if err != nil {
 		if strings.Contains(err.Error(), "approval_requests_pending_instance_idx") {
 			return nil, errors.New("该实例已有同类型审批正在处理")
@@ -154,6 +158,9 @@ func (s *Service) restoreInstanceTx(ctx context.Context, tx pgx.Tx, actor string
 	}
 	if restoreCount >= 1 {
 		return nil, errors.New("该实例已使用过一次保留期恢复，不能再次恢复")
+	}
+	if err := s.enforceLeasePolicy(ctx, tx, owner, instanceID, time.Now().Add(time.Duration(hours)*time.Hour)); err != nil {
+		return nil, err
 	}
 	var activeTasks int
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE resource_id=$1::uuid AND status IN ('PENDING','RUNNING')`, instanceID).Scan(&activeTasks); err != nil {

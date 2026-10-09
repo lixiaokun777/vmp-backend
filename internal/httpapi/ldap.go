@@ -181,12 +181,17 @@ func (a *API) ldapSync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 502, "LDAP 用户查询失败："+err.Error())
 		return
 	}
-	tx, err := a.Service.DB.Begin(r.Context())
+	current, _ := userFromRequest(r)
+	tx, err := a.beginUserAdministration(r.Context(), current.ID)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if err := requireLocalAdministrator(r.Context(), tx); err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
 	synced := 0
 	skipped := 0
 	syncedUsernames := make([]string, 0, len(result.Entries))

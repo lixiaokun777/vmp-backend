@@ -103,6 +103,7 @@ func mockLDAP(t *testing.T, usernames []string) (string, func() ([]string, [][]b
 			mu.Unlock()
 			go func(peer net.Conn) {
 				defer peer.Close()
+				page := 0
 				for {
 					request, err := ber.ReadPacket(peer)
 					if err != nil || len(request.Children) < 2 {
@@ -120,7 +121,13 @@ func mockLDAP(t *testing.T, usernames []string) (string, func() ([]string, [][]b
 						mu.Lock()
 						filters = append(filters, append([]byte(nil), body.Children[6].Bytes()...))
 						mu.Unlock()
-						for index, username := range usernames {
+						start, end := 0, len(usernames)
+						if len(usernames) > 500 {
+							start = page * 500
+							end = min(len(usernames), start+500)
+							page++
+						}
+						for index, username := range usernames[start:end] {
 							packet := ber.NewSequence("目录条目")
 							packet.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, id, "消息编号"))
 							entry := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ldap.ApplicationSearchResultEntry, nil, "用户")
@@ -138,7 +145,17 @@ func mockLDAP(t *testing.T, usernames []string) (string, func() ([]string, [][]b
 								return
 							}
 						}
-						peer.Write(response(id, ldap.ApplicationSearchResultDone, ldap.LDAPResultSuccess).Bytes())
+						done := response(id, ldap.ApplicationSearchResultDone, ldap.LDAPResultSuccess)
+						if len(usernames) > 500 {
+							control := ldap.NewControlPaging(500)
+							if end < len(usernames) {
+								control.SetCookie([]byte(fmt.Sprint(page)))
+							}
+							controls := ber.Encode(ber.ClassContext, ber.TypeConstructed, 0, nil, "分页控件")
+							controls.AppendChild(control.Encode())
+							done.AppendChild(controls)
+						}
+						peer.Write(done.Bytes())
 					default:
 						return
 					}
@@ -400,13 +417,20 @@ func TestScopedAgentIdentityDatabase(t *testing.T) {
 func TestLDAPSyncPreservesPlatformDisableDatabase(t *testing.T) {
 	pool := identityTestDatabase(t)
 	ctx := context.Background()
+	var adminID string
+	if err := pool.QueryRow(ctx, `INSERT INTO users(username,role,source,password_hash) VALUES('emergency','ADMIN','LOCAL',crypt('FixtureStrong123!',gen_salt('bf',4))) RETURNING id::text`).Scan(&adminID); err != nil {
+		t.Fatal(err)
+	}
+	adminRequest := func() *http.Request {
+		return httptest.NewRequest("POST", "/api/v1/ldap/sync", nil).WithContext(context.WithValue(ctx, authContextKey{}, AuthUser{ID: adminID, Username: "emergency", Role: "ADMIN", Source: "LOCAL"}))
+	}
 	if _, err := pool.Exec(ctx, `INSERT INTO users(username,role,source,ldap_dn,enabled) VALUES('review','ADMIN','LDAP','uid=review,dc=test',false)`); err != nil {
 		t.Fatal(err)
 	}
 	url, _ := mockLDAP(t, []string{"review"})
 	a := &API{Service: &platform.Service{DB: pool}, LDAP: LDAPConfig{Active: true, URL: url, BaseDN: "dc=test", LoginFilter: "(uid=%s)", SyncFilter: "(objectClass=person)", UsernameAttr: "uid", DisplayNameAttr: "cn", EmailAttr: "mail"}}
 	w := httptest.NewRecorder()
-	a.ldapSync(w, httptest.NewRequest("POST", "/api/v1/ldap/sync", nil))
+	a.ldapSync(w, adminRequest())
 	if w.Code != 200 {
 		t.Fatalf("目录同步失败：%d", w.Code)
 	}
@@ -420,7 +444,7 @@ func TestLDAPSyncPreservesPlatformDisableDatabase(t *testing.T) {
 	url, _ = mockLDAP(t, nil)
 	a.LDAP.URL = url
 	w = httptest.NewRecorder()
-	a.ldapSync(w, httptest.NewRequest("POST", "/api/v1/ldap/sync", nil))
+	a.ldapSync(w, adminRequest())
 	if w.Code != 200 {
 		t.Fatalf("空目录同步失败：%d", w.Code)
 	}

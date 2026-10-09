@@ -52,19 +52,26 @@ type Heartbeat struct {
 }
 
 type HostFacts struct {
-	Hostname          string   `json:"hostname"`
-	Architecture      string   `json:"architecture"`
-	KernelVersion     string   `json:"kernel_version"`
-	LibvirtURI        string   `json:"libvirt_uri"`
-	LibvirtVersion    string   `json:"libvirt_version"`
-	HypervisorVersion string   `json:"hypervisor_version"`
-	StorageRoot       string   `json:"storage_root"`
-	ImageRoot         string   `json:"image_root"`
-	Bridges           []string `json:"bridges"`
-	TotalMemoryMB     int      `json:"total_memory_mb"`
-	AvailableMemoryMB int      `json:"available_memory_mb"`
-	StorageFreeGB     int      `json:"storage_free_gb"`
-	ConsoleURL        string   `json:"console_url,omitempty"`
+	Hostname              string               `json:"hostname"`
+	Architecture          string               `json:"architecture"`
+	KernelVersion         string               `json:"kernel_version"`
+	LibvirtURI            string               `json:"libvirt_uri"`
+	LibvirtVersion        string               `json:"libvirt_version"`
+	HypervisorVersion     string               `json:"hypervisor_version"`
+	StorageRoot           string               `json:"storage_root"`
+	ImageRoot             string               `json:"image_root"`
+	Bridges               []string             `json:"bridges"`
+	TotalMemoryMB         int                  `json:"total_memory_mb"`
+	AvailableMemoryMB     int                  `json:"available_memory_mb"`
+	StorageFreeGB         int                  `json:"storage_free_gb"`
+	ConsoleURL            string               `json:"console_url,omitempty"`
+	BudgetSource          string               `json:"budget_source"`
+	SafeAvailableMemoryMB int                  `json:"safe_available_memory_mb"`
+	SafeAvailableDiskGB   int                  `json:"safe_available_disk_gb"`
+	ReadinessComplete     bool                 `json:"readiness_complete"`
+	ResourceMeasuredAt    time.Time            `json:"resource_measured_at"`
+	Images                []ImageObservation   `json:"images"`
+	Networks              []NetworkObservation `json:"networks"`
 }
 
 type Domain struct {
@@ -76,6 +83,8 @@ type Domain struct {
 	Ownership          string         `json:"ownership"`
 	PlatformInstanceID string         `json:"platform_instance_id,omitempty"`
 	Metadata           map[string]any `json:"metadata,omitempty"`
+	DeliveryStatus     string         `json:"delivery_status,omitempty"`
+	DeliveryMessage    string         `json:"delivery_message,omitempty"`
 }
 
 type Check struct {
@@ -85,12 +94,19 @@ type Check struct {
 }
 
 type TaskResult struct {
-	ClaimToken  string `json:"claim_token,omitempty"`
-	Success     bool   `json:"success"`
-	ProviderRef string `json:"provider_ref"`
-	IPAddress   string `json:"ip_address"`
-	ErrorCode   string `json:"error_code"`
-	Error       string `json:"error"`
+	ClaimToken      string `json:"claim_token,omitempty"`
+	Success         bool   `json:"success"`
+	ProviderRef     string `json:"provider_ref"`
+	IPAddress       string `json:"ip_address"`
+	ErrorCode       string `json:"error_code"`
+	Error           string `json:"error"`
+	ImageID         string `json:"image_id,omitempty"`
+	ImageChecksum   string `json:"checksum,omitempty"`
+	ImageFileName   string `json:"file_name,omitempty"`
+	ImageGeneration int    `json:"image_generation,omitempty"`
+	ProviderStatus  string `json:"provider_status,omitempty"`
+	DeliveryStatus  string `json:"delivery_status,omitempty"`
+	DeliveryMessage string `json:"delivery_message,omitempty"`
 }
 
 func New(ctx context.Context, databaseURL string) (*Service, error) {
@@ -133,26 +149,45 @@ func (s *Service) createApplicationTx(ctx context.Context, tx pgx.Tx, actor stri
 	if err := tx.QueryRow(ctx, `SELECT cpu, memory_mb, disk_gb,name FROM flavors WHERE id=$1 AND enabled FOR SHARE`, in.FlavorID).Scan(&cpu, &memoryMB, &diskGB, &flavorName); err != nil {
 		return nil, fmt.Errorf("invalid flavor: %w", err)
 	}
-	var imageName, imageFile, imagePath, osFamily string
-	if err := tx.QueryRow(ctx, `SELECT name,file_name,CASE WHEN source_type='local' THEN coalesce(source_location,file_name) ELSE file_name END,os_family FROM images WHERE id=$1 AND enabled AND sync_status='READY'`, in.ImageID).Scan(&imageName, &imageFile, &imagePath, &osFamily); err != nil {
+	if err := s.enforceCreateQuota(ctx, tx, actor, cpu, memoryMB, diskGB, in.LeaseHours); err != nil {
+		return nil, err
+	}
+	var imageName, imageFile, imagePath, osFamily, imageChecksum, sourceType string
+	var imageGeneration int
+	if err := tx.QueryRow(ctx, `SELECT name,file_name,CASE WHEN source_type='local' THEN coalesce(source_location,file_name) ELSE '.vmp-cache/'||lower(checksum)||'/'||file_name END,os_family,coalesce(checksum,''),source_type,generation FROM images WHERE id=$1 AND enabled AND sync_status='READY'`, in.ImageID).Scan(&imageName, &imageFile, &imagePath, &osFamily, &imageChecksum, &sourceType, &imageGeneration); err != nil {
 		return nil, fmt.Errorf("invalid image: %w", err)
+	}
+	if in.NetworkID == "" {
+		if err := tx.QueryRow(ctx, `SELECT id::text FROM networks WHERE enabled ORDER BY created_at LIMIT 1`).Scan(&in.NetworkID); err != nil {
+			return nil, errors.New("没有启用网络")
+		}
 	}
 
 	var hostID, hostName string
 	err := tx.QueryRow(ctx, `
-		SELECT id::text, name FROM hosts
-		WHERE status='ACTIVE'
-		  AND agent_mode <> 'kvm-readonly'
-		  AND allocatable_cpu-reserved_cpu >= $1
-		  AND allocatable_memory_mb-reserved_memory_mb >= $2
-		  AND allocatable_disk_gb-reserved_disk_gb >= $3
-		ORDER BY (allocatable_memory_mb-reserved_memory_mb) DESC, name
-		FOR UPDATE SKIP LOCKED LIMIT 1`, cpu, memoryMB, diskGB).Scan(&hostID, &hostName)
+		SELECT h.id::text,h.name FROM hosts h
+		JOIN host_images hi ON hi.host_id=h.id AND hi.image_id=$4 AND hi.generation=$5 AND hi.status='READY' AND hi.reported_at>now()-interval '120 seconds'
+		JOIN host_networks hn ON hn.host_id=h.id AND hn.network_id=$6::uuid AND hn.ready AND hn.reported_at>now()-interval '120 seconds'
+		JOIN networks n ON n.id=hn.network_id AND n.enabled AND n.bridge=hn.bridge
+		WHERE h.status='ACTIVE' AND h.agent_mode='kvm' AND h.budget_source='CONFIGURED_TOTAL'
+		  AND h.resource_measured_at BETWEEN now()-interval '120 seconds' AND now()+interval '30 seconds'
+		  AND h.allocatable_cpu-h.reserved_cpu >= $1
+		  AND h.allocatable_memory_mb-h.reserved_memory_mb >= $2
+		  AND h.allocatable_disk_gb-h.reserved_disk_gb >= $3
+		  AND h.safe_available_memory_mb-coalesce((SELECT sum(p.allocated_memory_mb) FROM instances p WHERE p.host_id=h.id AND p.lifecycle_status<>'RELEASED' AND (p.created_at>h.resource_measured_at OR p.lifecycle_status IN ('PROVISIONING','STARTING') AND NOT(p.last_domain_seen_at>=h.resource_measured_at AND p.observed_domain_status='RUNNING'))),0)>=$2
+		  AND h.safe_available_disk_gb-coalesce((SELECT sum(p.allocated_disk_gb) FROM instances p WHERE p.host_id=h.id AND p.lifecycle_status<>'RELEASED' AND (p.created_at>h.resource_measured_at OR p.lifecycle_status='PROVISIONING' AND NOT(coalesce(p.last_domain_seen_at>=h.resource_measured_at,false)))),0)>=$3
+		ORDER BY (h.allocatable_memory_mb-h.reserved_memory_mb) DESC,h.name
+		FOR UPDATE OF h SKIP LOCKED LIMIT 1`, cpu, memoryMB, diskGB, in.ImageID, imageGeneration, in.NetworkID).Scan(&hostID, &hostName)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, errors.New("no schedulable host has enough capacity")
+			return nil, errors.New("没有同时满足资源预算、实时安全余量、镜像和网络就绪条件的可调度宿主机")
 		}
 		return nil, err
+	}
+	if sourceType == "local" {
+		if err := tx.QueryRow(ctx, `SELECT checksum FROM host_images WHERE host_id=$1::uuid AND image_id=$2`, hostID, in.ImageID).Scan(&imageChecksum); err != nil {
+			return nil, err
+		}
 	}
 
 	var appID, requestNo string
@@ -164,10 +199,11 @@ func (s *Service) createApplicationTx(ctx context.Context, tx pgx.Tx, actor stri
 		return nil, err
 	}
 	var instanceID string
+	username := defaultUsername(osFamily)
 	err = tx.QueryRow(ctx, `
-		INSERT INTO instances(application_id, host_id, name, lifecycle_status, expires_at,allocated_cpu,allocated_memory_mb,allocated_disk_gb,flavor_name_snapshot)
-		VALUES ($1::uuid,$2::uuid,$3,'PROVISIONING',now()+make_interval(hours=>$4),$5,$6,$7,$8)
-		RETURNING id::text`, appID, hostID, in.InstanceName, in.LeaseHours, cpu, memoryMB, diskGB, flavorName).Scan(&instanceID)
+		INSERT INTO instances(application_id, host_id, name, lifecycle_status, expires_at,allocated_cpu,allocated_memory_mb,allocated_disk_gb,flavor_name_snapshot,network_id,delivery_status,username)
+		VALUES ($1::uuid,$2::uuid,$3,'PROVISIONING',now()+make_interval(hours=>$4),$5,$6,$7,$8,$9::uuid,'QUEUED',$10)
+		RETURNING id::text`, appID, hostID, in.InstanceName, in.LeaseHours, cpu, memoryMB, diskGB, flavorName, in.NetworkID, username).Scan(&instanceID)
 	if err != nil {
 		return nil, err
 	}
@@ -211,8 +247,7 @@ func (s *Service) createApplicationTx(ctx context.Context, tx pgx.Tx, actor stri
 	if err := tx.QueryRow(ctx, `SELECT crypt($1, gen_salt('bf', 12))`, password).Scan(&passwordHash); err != nil {
 		return nil, fmt.Errorf("generate password hash: %w", err)
 	}
-	username := defaultUsername(osFamily)
-	payload, err := json.Marshal(map[string]any{"instance_id": instanceID, "name": in.InstanceName, "cpu": cpu, "memory_mb": memoryMB, "disk_gb": diskGB, "image_id": in.ImageID, "image_name": imageName, "image_file": imageFile, "image_path": imagePath, "network_id": in.NetworkID, "network_name": networkName, "bridge": bridge, "mac_address": instanceMAC(instanceID), "ip_address": ipAddress, "prefix_length": prefixLength, "gateway": gateway, "dns_servers": dnsServers, "username": username, "password_hash": passwordHash})
+	payload, err := json.Marshal(map[string]any{"instance_id": instanceID, "name": in.InstanceName, "cpu": cpu, "memory_mb": memoryMB, "disk_gb": diskGB, "image_id": in.ImageID, "image_checksum": imageChecksum, "image_generation": imageGeneration, "image_name": imageName, "image_file": imageFile, "image_path": imagePath, "network_id": in.NetworkID, "network_name": networkName, "bridge": bridge, "mac_address": instanceMAC(instanceID), "ip_address": ipAddress, "prefix_length": prefixLength, "gateway": gateway, "dns_servers": dnsServers, "username": username, "password_hash": passwordHash})
 	if err != nil {
 		return nil, err
 	}
@@ -268,8 +303,30 @@ func (s *Service) Heartbeat(ctx context.Context, hostID string, hb Heartbeat) er
 		return err
 	}
 	defer tx.Rollback(ctx)
-	inventoryAt := time.Now().UTC()
-	tag, err := tx.Exec(ctx, `UPDATE hosts SET status=CASE WHEN status IN ('CORDONED','MAINTENANCE') THEN status ELSE $1 END,agent_allocatable_cpu=$2,agent_allocatable_memory_mb=$3,agent_allocatable_disk_gb=$4,allocatable_cpu=least($2,coalesce(quota_cpu,$2)),allocatable_memory_mb=least($3,coalesce(quota_memory_mb,$3)),allocatable_disk_gb=least($4,coalesce(quota_disk_gb,$4)),facts=$5,last_heartbeat_at=now(),last_inventory_at=$6,updated_at=now() WHERE id=$7::uuid`, status, hb.AllocatableCPU, hb.AllocatableMemoryMB, hb.AllocatableDiskGB, facts, inventoryAt, hostID)
+	if err := LockResourceReadiness(ctx, tx); err != nil {
+		return err
+	}
+	var previousInventory, previousMeasurement *time.Time
+	if err := tx.QueryRow(ctx, `SELECT last_inventory_at,resource_measured_at FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&previousInventory, &previousMeasurement); err != nil {
+		return err
+	}
+	inventoryAt := hb.Facts.ResourceMeasuredAt
+	if previousMeasurement != nil && !inventoryAt.IsZero() && inventoryAt.Before(*previousMeasurement) {
+		if _, err := tx.Exec(ctx, `UPDATE hosts SET last_heartbeat_at=now() WHERE id=$1::uuid`, hostID); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+	budgetSource := hb.Facts.BudgetSource
+	var safeMemory, safeDisk, measured any
+	if budgetSource == "CONFIGURED_TOTAL" && !inventoryAt.IsZero() && !inventoryAt.After(time.Now().Add(30*time.Second)) && hb.Facts.SafeAvailableMemoryMB >= 0 && hb.Facts.SafeAvailableDiskGB >= 0 {
+		safeMemory, safeDisk, measured = hb.Facts.SafeAvailableMemoryMB, hb.Facts.SafeAvailableDiskGB, inventoryAt
+	} else {
+		budgetSource = "LEGACY"
+		inventoryAt = time.Now().UTC()
+	}
+	freshInventory := budgetSource == "CONFIGURED_TOTAL" && hb.InventoryComplete && (previousInventory == nil || inventoryAt.After(*previousInventory))
+	tag, err := tx.Exec(ctx, `UPDATE hosts SET status=CASE WHEN status IN ('CORDONED','MAINTENANCE') THEN status ELSE $1 END,agent_allocatable_cpu=$2,agent_allocatable_memory_mb=$3,agent_allocatable_disk_gb=$4,allocatable_cpu=least($2,coalesce(quota_cpu,$2)),allocatable_memory_mb=least($3,coalesce(quota_memory_mb,$3)),allocatable_disk_gb=least($4,coalesce(quota_disk_gb,$4)),facts=$5,last_heartbeat_at=now(),last_inventory_at=CASE WHEN $11 THEN $6::timestamptz ELSE last_inventory_at END,budget_source=$8,safe_available_memory_mb=$9,safe_available_disk_gb=$10,resource_measured_at=$12,updated_at=now() WHERE id=$7::uuid`, status, hb.AllocatableCPU, hb.AllocatableMemoryMB, hb.AllocatableDiskGB, facts, inventoryAt, hostID, budgetSource, safeMemory, safeDisk, freshInventory, measured)
 	if err == nil && tag.RowsAffected() == 0 {
 		return pgx.ErrNoRows
 	}
@@ -294,11 +351,19 @@ func (s *Service) Heartbeat(ctx context.Context, hostID string, hb Heartbeat) er
 			return err
 		}
 	}
-	if hb.InventoryComplete {
+	if freshInventory {
 		_, err = tx.Exec(ctx, `DELETE FROM discovered_instances WHERE host_id=$1::uuid AND last_seen_at < $2`, hostID, inventoryAt)
 		if err != nil {
 			return err
 		}
+	}
+	if budgetSource == "CONFIGURED_TOTAL" {
+		if err := s.observeReadinessTx(ctx, tx, hostID, hb.Facts, inventoryAt); err != nil {
+			return err
+		}
+	}
+	if err := s.reconcileDomainObservationsTx(ctx, tx, hostID, hb.Domains, freshInventory, inventoryAt); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }
@@ -376,10 +441,10 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	var owner, hostID, name, username, ipAddress, lifecycleStatus string
+	var owner, hostID, name, username, ipAddress, lifecycleStatus, deliveryStatus string
 	var restoreCount int
 	var expiresAt time.Time
-	err = tx.QueryRow(ctx, `SELECT a.applicant,i.host_id::text,i.name,coalesce(i.username,''),coalesce(host(i.ip_address),''),i.lifecycle_status,i.expires_at,i.restore_count FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &hostID, &name, &username, &ipAddress, &lifecycleStatus, &expiresAt, &restoreCount)
+	err = tx.QueryRow(ctx, `SELECT a.applicant,i.host_id::text,i.name,coalesce(i.username,''),coalesce(host(i.ip_address),''),i.lifecycle_status,i.expires_at,i.restore_count,i.delivery_status FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &hostID, &name, &username, &ipAddress, &lifecycleStatus, &expiresAt, &restoreCount, &deliveryStatus)
 	if err != nil {
 		return nil, err
 	}
@@ -387,6 +452,9 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 		return nil, errors.New("instance does not belong to the current user")
 	}
 	if action == "reset_password" {
+		if deliveryStatus != "READY" && deliveryStatus != "UNKNOWN" {
+			return nil, errors.New("交付尚未完成，初始cloud-init可能覆盖新密码；请等待就绪或先使用救援控制台检查")
+		}
 		if lifecycleStatus != "RUNNING" {
 			return nil, fmt.Errorf("instance password cannot be reset from status %s", lifecycleStatus)
 		}
@@ -430,10 +498,7 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 		if err != nil {
 			return nil, errors.New("failed create task was not found")
 		}
-		if _, err := tx.Exec(ctx, `UPDATE tasks SET status='PENDING',attempt=0,error_message=NULL,result=NULL,available_at=now(),claimed_at=NULL,completed_at=NULL,updated_at=now() WHERE id=$1::uuid`, failedTaskID); err != nil {
-			return nil, err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='PROVISIONING',updated_at=now() WHERE id=$1::uuid`, instanceID); err != nil {
+		if err := s.retryCreateTx(ctx, tx, instanceID, hostID, failedTaskID); err != nil {
 			return nil, err
 		}
 		_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.retry','instance',$2,'{}'::jsonb)`, actor, instanceID)
@@ -538,7 +603,8 @@ func (s *Service) renewInstanceTx(ctx context.Context, tx pgx.Tx, actor string, 
 		return nil, errors.New("实例、续期小时或续期原因无效")
 	}
 	var owner, lifecycleStatus string
-	err := tx.QueryRow(ctx, `SELECT a.applicant,i.lifecycle_status FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &lifecycleStatus)
+	var oldExpiry time.Time
+	err := tx.QueryRow(ctx, `SELECT a.applicant,i.lifecycle_status,i.expires_at FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &lifecycleStatus, &oldExpiry)
 	if err != nil {
 		return nil, err
 	}
@@ -552,7 +618,14 @@ func (s *Service) renewInstanceTx(ctx context.Context, tx pgx.Tx, actor string, 
 		return nil, fmt.Errorf("instance cannot be renewed from status %s", lifecycleStatus)
 	}
 	var expiresAt time.Time
-	err = tx.QueryRow(ctx, `UPDATE instances SET expires_at=greatest(expires_at,now())+make_interval(hours=>$1),updated_at=now() WHERE id=$2::uuid RETURNING expires_at`, hours, instanceID).Scan(&expiresAt)
+	if oldExpiry.Before(time.Now()) {
+		oldExpiry = time.Now()
+	}
+	expiresAt = oldExpiry.Add(time.Duration(hours) * time.Hour)
+	if err := s.enforceLeasePolicy(ctx, tx, owner, instanceID, expiresAt); err != nil {
+		return nil, err
+	}
+	err = tx.QueryRow(ctx, `UPDATE instances SET expires_at=$1,updated_at=now() WHERE id=$2::uuid RETURNING expires_at`, expiresAt, instanceID).Scan(&expiresAt)
 	if err != nil {
 		return nil, err
 	}
@@ -595,6 +668,11 @@ func (s *Service) PollTask(ctx context.Context, hostID string) (map[string]any, 
 	if err != nil {
 		return nil, err
 	}
+	if typ == "CREATE_INSTANCE" {
+		if _, err := tx.Exec(ctx, `UPDATE instances SET delivery_status='CREATING',delivery_message='宿主机正在创建磁盘和启动托管域',updated_at=now() WHERE id=(SELECT resource_id FROM tasks WHERE id=$1::uuid)`, id); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -609,6 +687,9 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := LockResourceReadiness(ctx, tx); err != nil {
+		return err
+	}
 	// 回执不依赖实例/任务外键；删除已完成并清表后，同一结果重发仍能安全确认。
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, taskID); err != nil {
 		return err
@@ -643,7 +724,9 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 	data, _ := json.Marshal(result)
 	if result.Success {
 		_, err = tx.Exec(ctx, `UPDATE tasks SET status='SUCCEEDED',result=$1,error_message=NULL,completed_at=now(),updated_at=now() WHERE id=$2::uuid`, data, taskID)
-		if err == nil {
+		if err == nil && taskType == "SYNC_IMAGE" {
+			err = s.applyImageSyncResultTx(ctx, tx, taskID, hostID, result)
+		} else if err == nil {
 			err = s.applySuccessfulTask(ctx, tx, taskType, resourceID, result)
 		}
 		if err == nil && (taskType == "CREATE_INSTANCE" || taskType == "START_INSTANCE") {
@@ -656,7 +739,9 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 			attempt = maxAttempts
 		}
 		_, err = tx.Exec(ctx, `UPDATE tasks SET status=CASE WHEN $3 OR attempt>=max_attempts THEN 'FAILED' ELSE 'PENDING' END,error_message=$1,available_at=now()+interval '15 seconds',completed_at=CASE WHEN $3 OR attempt>=max_attempts THEN now() ELSE NULL END,updated_at=now() WHERE id=$2::uuid`, result.Error, taskID, result.ErrorCode == "EXECUTION_UNCERTAIN")
-		if err == nil && attempt >= maxAttempts {
+		if err == nil && taskType == "SYNC_IMAGE" {
+			err = s.applyImageSyncResultTx(ctx, tx, taskID, hostID, result)
+		} else if err == nil && attempt >= maxAttempts {
 			if _, err = tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,updated_at=now() WHERE id=$2::uuid`, terminalFailureStatus(taskType), resourceID); err != nil {
 				return err
 			}
@@ -665,6 +750,9 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 					return err
 				}
 			}
+		}
+		if err == nil && taskType == "CREATE_INSTANCE" {
+			_, err = tx.Exec(ctx, `UPDATE instances SET delivery_status=CASE WHEN $2 THEN 'FAILED' ELSE 'QUEUED' END,delivery_message=$3,updated_at=now() WHERE id=$1::uuid`, resourceID, attempt >= maxAttempts, safeObservationMessage(result.Error))
 		}
 	}
 	if err != nil {
@@ -728,7 +816,11 @@ func (s *Service) retryCreateWithNextIPAddress(ctx context.Context, tx pgx.Tx, t
 func (s *Service) applySuccessfulTask(ctx context.Context, tx pgx.Tx, taskType, resourceID string, result TaskResult) error {
 	switch taskType {
 	case "CREATE_INSTANCE":
-		if _, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='RUNNING',provider_status='RUNNING',provider_ref=$1,ip_address=nullif($2,'')::inet,updated_at=now() WHERE id=$3::uuid`, result.ProviderRef, result.IPAddress, resourceID); err != nil {
+		delivery := normalizeDeliveryStatus(result.DeliveryStatus)
+		if delivery == "UNKNOWN" {
+			delivery = "GUEST_PENDING"
+		}
+		if _, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='RUNNING',provider_status='RUNNING',provider_ref=$1,ip_address=coalesce(nullif($2,'')::inet,ip_address),delivery_status=$4,delivery_message=$5,updated_at=now() WHERE id=$3::uuid`, result.ProviderRef, result.IPAddress, resourceID, delivery, safeObservationMessage(result.DeliveryMessage)); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `UPDATE ip_addresses SET status='ALLOCATED',allocated_at=now(),updated_at=now() WHERE instance_id=$1::uuid`, resourceID)

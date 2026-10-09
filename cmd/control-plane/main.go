@@ -68,6 +68,7 @@ func main() {
 	}
 	go api.StartNotificationLoop(ctx)
 	go api.StartLoginProtectionCleanup(ctx)
+	go api.StartGovernanceLoop(ctx)
 	server := &http.Server{Addr: env("LISTEN_ADDR", ":8080"), Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 << 10}
 	go func() {
 		<-ctx.Done()

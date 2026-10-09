@@ -3,12 +3,12 @@ services:
     build:
       context: ../..
       args:
-        GO_BUILD_IMAGE: ${GO_BUILD_IMAGE:-golang:1.23-alpine}
-        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-alpine:3.21}
+        GO_BUILD_IMAGE: ${GO_BUILD_IMAGE:-golang:1.27.2-alpine}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-alpine:3.24.2}
 
   web:
     build:
       # 源码构建要求 vmp-backend 与 vmp-frontend 位于同一父目录。
       context: ../../../vmp-frontend
       args:
-        NGINX_IMAGE: ${NGINX_IMAGE:-nginx:1.27-alpine}
+        NGINX_IMAGE: ${NGINX_IMAGE:-nginx:1.30.5-alpine}

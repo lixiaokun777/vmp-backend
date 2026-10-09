@@ -6,7 +6,8 @@ VMP 虚拟机申领平台的控制面。负责资源规格、镜像、网络 IP�
 
 ## 当前能力
 
-- 当前未发布 P1 源码修复、兼容协议和测试见 [P1 修复与验收](docs/P1修复与验收.md)，旧 Docker 固定镜像尚不包含这些变更。
+- `0.5.0` 是三个组件配套发布的可靠性版本，包含 [P1 修复](docs/P1修复与验收.md) 和 [P2 优化与治理](docs/P2功能与验收.md)。旧 `0.4.x` 镜像不包含本轮协议，不能混用。
+- 实际测试范围、宿主只读预检结果和上线限制见 [0.5.0 发布验收](docs/0.5.0发布验收.md)；隔离测试不等于生产 KVM 写操作已验收。
 - 每宿主独立身份、任务租约/确认回执、分配快照、原子审批与 LDAP 范围控制已接入；旧环境必须配套升级三个组件，见 [凭据升级](docs/身份与凭据加固.md)。
 
 - 本地与 LDAP 登录提供持久化账号冷却、来源 IP 限流和可信代理校验。详见 [登录保护](docs/登录保护.md)。
@@ -36,16 +37,14 @@ VMP 虚拟机申领平台的控制面。负责资源规格、镜像、网络 IP�
 
 ## 快速启动
 
-正式已发布版本可按部署指南拉取固定镜像。当前未发布 P1 分支须准备同级前端并使用源码构建，不能只拉旧固定镜像就认为已应用修复：
+使用配套固定镜像部署，首次必须修改所有密码和随机密钥：
 
 ```bash
 cp .env.example .env
 chmod 600 .env
 # 编辑 .env：填写随机引导令牌、管理员/数据库密码及独立加密/控制台密钥。
 # 引导令牌可用 openssl rand -hex 32 生成，公开示例值会拒绝启动。
-VMP_BACKEND_IMAGE=vmp-backend:p1-local VMP_FRONTEND_IMAGE=vmp-frontend:p1-local \
-  docker compose --env-file .env -f deployments/compose/compose.yaml \
-  -f deployments/compose/compose.build.yaml up -d --build
+docker compose --env-file .env -f deployments/compose/compose.yaml up -d
 curl http://127.0.0.1:8080/api/v1/health
 ```
 
@@ -53,7 +52,11 @@ curl http://127.0.0.1:8080/api/v1/health
 
 从系统要求、密钥生成、KVM 宿主机纳管、镜像和网络准备，到备份、升级、回滚和排障的完整说明见 [完整部署指南](docs/部署指南.md)。
 
+`0.5.0` 还提供服务器分页、按宿主镜像/网络就绪调度、远程镜像同步、ARP/Guest Agent 分层交付、保守域对账、创建救援控制台、审批代理/转交、平台事件群通知、资源公平使用与自动续期上限、可校验历史归档。默认额度不限制、自动续期关闭、历史永久保留；配置和明确边界见 [P2 功能](docs/P2功能与验收.md)。
+
 ## 本地开发
+
+后端依赖最低 Go 1.26；本版验证与发布使用 Go 1.27.2，建议采用配套镜像而不是旧工具链自行构建。Agent 安全根目录操作最低 Go 1.24，官方发布也使用 1.27.2。
 
 ```bash
 go test ./...

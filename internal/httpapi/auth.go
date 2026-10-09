@@ -221,6 +221,9 @@ func ordinaryUserRouteAllowed(r *http.Request) bool {
 	if path == "/api/v1/applications" && r.Method == http.MethodPost {
 		return true
 	}
+	if r.Method == http.MethodGet && (path == "/api/v1/console/vnc" || path == "/api/v1/console/serial") {
+		return true
+	}
 	if strings.HasPrefix(path, "/api/v1/approvals/") && r.Method == http.MethodPost {
 		parts := strings.Split(strings.TrimPrefix(path, "/api/v1/approvals/"), "/")
 		if len(parts) == 2 && parts[0] != "" && (parts[1] == "withdraw" || parts[1] == "resubmit-short") {
@@ -236,6 +239,9 @@ func ordinaryUserRouteAllowed(r *http.Request) bool {
 			return true
 		}
 		if r.Method == http.MethodPost && len(parts) == 2 && parts[0] != "" && parts[1] == "console-sessions" {
+			return true
+		}
+		if (r.Method == http.MethodGet || r.Method == http.MethodPut) && len(parts) == 2 && parts[0] != "" && parts[1] == "auto-renew" {
 			return true
 		}
 	}
