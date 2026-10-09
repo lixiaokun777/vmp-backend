@@ -1,5 +1,7 @@
 # API 说明
 
+`0.5.2` 注册补修：`POST /agents/register` 可带合法裸 IP `management_ip`，须以该宿主独立凭据更新已有地址。续注册省略、空字符串或空白时保持原地址，不从请求来源推断；非法 IP/CIDR/zone 返回 422，不能以引导令牌修改已纳管宿主。前端 `0.5.1` API 保持兼容，无新增迁移。
+
 ## 服务器分页与资源就绪（0.5.1）
 
 `GET /users`、`GET /instances`、`GET /approvals`、`GET /ip-addresses`返回 `{items,total,page,page_size}`，默认1页/20条，上限100，越界页夹到最后一页；总数和记录使用同一只读快照。所有支持keyword；users额外role/source/status，instances额外status/host_id/scope=mine，approvals额外status/type/scope=mine，IP必填network_id并支持status。完整枚举和字段见 [资源就绪与服务器分页](资源就绪与服务器分页.md)。普通用户始终限自己的实例/审批，scope=all不能越权。

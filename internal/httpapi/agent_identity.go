@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/netip"
 	"strings"
 
 	"github.com/google/uuid"
@@ -32,6 +33,15 @@ func (a *API) registerScopedAgent(w http.ResponseWriter, r *http.Request) {
 	if input.Mode != "kvm" && input.Mode != "kvm-readonly" && input.Mode != "mock" {
 		writeError(w, 422, "宿主机模式无效")
 		return
+	}
+	input.ManagementIP = strings.TrimSpace(input.ManagementIP)
+	if input.ManagementIP != "" {
+		address, err := netip.ParseAddr(input.ManagementIP)
+		if err != nil || address.Zone() != "" {
+			writeError(w, 422, "宿主机管理地址必须是合法IP，不能包含网段或区域标识")
+			return
+		}
+		input.ManagementIP = address.String()
 	}
 	tx, err := a.Service.DB.Begin(r.Context())
 	if err != nil {
@@ -76,7 +86,8 @@ func (a *API) registerScopedAgent(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 401, "已有宿主必须使用独立运行凭据；丢失或升级凭据请联系管理员重新签发")
 			return
 		}
-		if err = tx.QueryRow(r.Context(), `UPDATE hosts SET agent_mode=$2,status=CASE WHEN $2='kvm-readonly' THEN 'CORDONED' WHEN status IN ('CORDONED','MAINTENANCE') THEN status ELSE 'ACTIVE' END,management_ip=nullif($3,'')::inet,agent_allocatable_cpu=$4,agent_allocatable_memory_mb=$5,agent_allocatable_disk_gb=$6,allocatable_cpu=least($4,coalesce(quota_cpu,$4)),allocatable_memory_mb=least($5,coalesce(quota_memory_mb,$5)),allocatable_disk_gb=least($6,coalesce(quota_disk_gb,$6)),last_heartbeat_at=now(),updated_at=now() WHERE id=$1::uuid RETURNING status`, hostID, input.Mode, input.ManagementIP, input.AllocatableCPU, input.AllocatableMemoryMB, input.AllocatableDiskGB).Scan(&status); err != nil {
+		// 续注册不提供管理地址表示保持原纳管值，不能从来源连接地址推断或清空它。
+		if err = tx.QueryRow(r.Context(), `UPDATE hosts SET agent_mode=$2,status=CASE WHEN $2='kvm-readonly' THEN 'CORDONED' WHEN status IN ('CORDONED','MAINTENANCE') THEN status ELSE 'ACTIVE' END,management_ip=coalesce(nullif($3,'')::inet,management_ip),agent_allocatable_cpu=$4,agent_allocatable_memory_mb=$5,agent_allocatable_disk_gb=$6,allocatable_cpu=least($4,coalesce(quota_cpu,$4)),allocatable_memory_mb=least($5,coalesce(quota_memory_mb,$5)),allocatable_disk_gb=least($6,coalesce(quota_disk_gb,$6)),last_heartbeat_at=now(),updated_at=now() WHERE id=$1::uuid RETURNING status`, hostID, input.Mode, input.ManagementIP, input.AllocatableCPU, input.AllocatableMemoryMB, input.AllocatableDiskGB).Scan(&status); err != nil {
 			writeError(w, 422, "宿主机地址或资源信息无效")
 			return
 		}
