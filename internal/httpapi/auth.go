@@ -77,14 +77,14 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 	var enabled bool
 	var passwordOK bool
 	var ldapDN string
-	err := a.Service.DB.QueryRow(r.Context(), `SELECT id::text,username,display_name,email,role,source,enabled,must_change_password,coalesce(ldap_dn,''),CASE WHEN source='LOCAL' THEN password_hash=crypt($2,password_hash) ELSE false END FROM users WHERE lower(username)=lower($1) AND source=$3`, input.Username, input.Password, input.Source).Scan(&user.ID, &user.Username, &user.DisplayName, &user.Email, &user.Role, &user.Source, &enabled, &user.MustChangePassword, &ldapDN, &passwordOK)
+	err := a.Service.DB.QueryRow(r.Context(), `SELECT id::text,username,display_name,email,role,source,enabled AND (source<>'LDAP' OR ldap_directory_present),must_change_password,coalesce(ldap_dn,''),CASE WHEN source='LOCAL' THEN password_hash=crypt($2,password_hash) ELSE false END FROM users WHERE lower(username)=lower($1) AND source=$3`, input.Username, input.Password, input.Source).Scan(&user.ID, &user.Username, &user.DisplayName, &user.Email, &user.Role, &user.Source, &enabled, &user.MustChangePassword, &ldapDN, &passwordOK)
 	if err != nil || !enabled {
 		a.recordAudit(r.Context(), r, input.Username, "auth.login", "session", input.Username, "FAILED", map[string]any{"source": input.Source, "reason": "invalid_credentials_or_disabled"})
 		writeError(w, 401, "用户名或密码错误")
 		return
 	}
 	if user.Source == "LDAP" {
-		if err := a.authenticateLDAP(r.Context(), ldapDN, input.Password); err != nil {
+		if err := a.authenticateLDAP(r.Context(), user.Username, input.Password); err != nil {
 			a.recordAudit(r.Context(), r, input.Username, "auth.login", "session", input.Username, "FAILED", map[string]any{"source": input.Source, "reason": "invalid_credentials"})
 			writeError(w, 401, "用户名或密码错误")
 			return
@@ -186,9 +186,14 @@ func (a *API) authenticate(next http.Handler) http.Handler {
 		}
 		hash := sha256.Sum256([]byte(cookie.Value))
 		var user AuthUser
-		err = a.Service.DB.QueryRow(r.Context(), `SELECT u.id::text,u.username,u.display_name,u.email,u.role,u.source,u.must_change_password FROM user_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now() AND u.enabled`, hash[:]).Scan(&user.ID, &user.Username, &user.DisplayName, &user.Email, &user.Role, &user.Source, &user.MustChangePassword)
+		err = a.Service.DB.QueryRow(r.Context(), `SELECT u.id::text,u.username,u.display_name,u.email,u.role,u.source,u.must_change_password FROM user_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now() AND u.enabled AND (u.source<>'LDAP' OR u.ldap_directory_present)`, hash[:]).Scan(&user.ID, &user.Username, &user.DisplayName, &user.Email, &user.Role, &user.Source, &user.MustChangePassword)
 		if err != nil {
 			writeError(w, 401, "登录已失效，请重新登录")
+			return
+		}
+		// Cookie 写请求必须由平台客户端主动携带自定义头；跨源简单请求不能冒用会话。
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Header.Get("X-VMP-Request") != "1" {
+			writeError(w, 403, "请求安全校验失败，请从平台页面重新操作")
 			return
 		}
 		_, _ = a.Service.DB.Exec(r.Context(), `UPDATE user_sessions SET last_seen_at=now() WHERE token_hash=$1 AND last_seen_at<now()-interval '5 minutes'`, hash[:])

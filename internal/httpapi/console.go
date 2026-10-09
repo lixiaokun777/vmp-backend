@@ -87,8 +87,7 @@ func (a *API) createConsoleSession(w http.ResponseWriter, r *http.Request) {
 
 // consumeConsoleSession 由目标宿主机 Agent 在 WebSocket 升级前调用，原子核销一次性票据。
 func (a *API) consumeConsoleSession(w http.ResponseWriter, r *http.Request) {
-	if !tokenOK(r, a.AgentToken, "Authorization") {
-		writeError(w, 401, "unauthorized")
+	if !a.authorizeAgent(w, r) {
 		return
 	}
 	var input struct {

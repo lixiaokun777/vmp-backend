@@ -19,6 +19,14 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	bootstrapToken := os.Getenv("AGENT_BOOTSTRAP_TOKEN")
+	if err := httpapi.ValidateAgentBootstrapSecret(bootstrapToken); err != nil {
+		slog.Error("Agent 引导凭据无效，拒绝启动", "error", err)
+		os.Exit(1)
+	}
+	if os.Getenv("AGENT_RUNTIME_TOKEN") != "" {
+		slog.Warn("AGENT_RUNTIME_TOKEN 已弃用且不参与认证；请按宿主独立凭据迁移文档升级 Agent")
+	}
 	databaseURL := env("DATABASE_URL", "postgres://vmlease:vmlease-dev@localhost:5432/vmlease?sslmode=disable")
 	trustedProxies, err := httpapi.ParseTrustedProxies(os.Getenv("TRUSTED_PROXY_CIDRS"))
 	if err != nil {
@@ -34,8 +42,7 @@ func main() {
 	go platform.StartReconciler(ctx, service)
 	api := &httpapi.API{
 		Service:               service,
-		BootstrapToken:        env("AGENT_BOOTSTRAP_TOKEN", "dev-bootstrap-token"),
-		AgentToken:            env("AGENT_RUNTIME_TOKEN", "dev-agent-token"),
+		BootstrapToken:        bootstrapToken,
 		SessionTTL:            time.Duration(envInt("SESSION_TTL_HOURS", 12)) * time.Hour,
 		SessionSecure:         envBool("SESSION_COOKIE_SECURE", false),
 		TrustedProxies:        trustedProxies,
@@ -61,7 +68,7 @@ func main() {
 	}
 	go api.StartNotificationLoop(ctx)
 	go api.StartLoginProtectionCleanup(ctx)
-	server := &http.Server{Addr: env("LISTEN_ADDR", ":8080"), Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Addr: env("LISTEN_ADDR", ":8080"), Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 << 10}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

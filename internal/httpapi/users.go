@@ -12,7 +12,7 @@ import (
 var usernamePattern = regexp.MustCompile(`^[a-zA-Z0-9._-]{2,64}$`)
 
 func (a *API) users(w http.ResponseWriter, r *http.Request) {
-	a.queryList(w, r, `SELECT jsonb_build_object('id',id,'username',username,'display_name',display_name,'email',email,'role',role,'source',source,'enabled',enabled,'must_change_password',must_change_password,'last_login_at',last_login_at,'created_at',created_at) FROM users ORDER BY role,username`)
+	a.queryList(w, r, `SELECT jsonb_build_object('id',id,'username',username,'display_name',display_name,'email',email,'role',role,'source',source,'enabled',enabled,'ldap_directory_present',ldap_directory_present,'must_change_password',must_change_password,'last_login_at',last_login_at,'created_at',created_at) FROM users ORDER BY role,username`)
 }
 
 func (a *API) createLocalUser(w http.ResponseWriter, r *http.Request) {

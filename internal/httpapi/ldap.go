@@ -114,6 +114,9 @@ func (a *API) updateLDAPConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) ldapTest(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	defer cancel()
+	r = r.WithContext(ctx)
 	config, err := a.loadLDAPConfig(r.Context())
 	if err != nil {
 		writeError(w, 500, "读取 LDAP 配置失败："+err.Error())
@@ -123,12 +126,12 @@ func (a *API) ldapTest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 422, "LDAP 尚未启用或配置不完整")
 		return
 	}
-	connection, err := openLDAP(config)
+	connection, cleanup, err := openLDAP(r.Context(), config)
 	if err != nil {
 		writeError(w, 502, "连接 LDAP 失败："+err.Error())
 		return
 	}
-	defer connection.Close()
+	defer cleanup()
 	if config.BindDN != "" {
 		if err := connection.Bind(config.BindDN, config.BindPassword); err != nil {
 			writeError(w, 502, "LDAP 服务账号认证失败")
@@ -144,6 +147,9 @@ func (a *API) ldapTest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) ldapSync(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	r = r.WithContext(ctx)
 	config, err := a.loadLDAPConfig(r.Context())
 	if err != nil {
 		writeError(w, 500, "读取 LDAP 配置失败："+err.Error())
@@ -153,12 +159,12 @@ func (a *API) ldapSync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 422, "LDAP 尚未启用或配置不完整")
 		return
 	}
-	connection, err := openLDAP(config)
+	connection, cleanup, err := openLDAP(r.Context(), config)
 	if err != nil {
 		writeError(w, 502, "连接 LDAP 失败："+err.Error())
 		return
 	}
-	defer connection.Close()
+	defer cleanup()
 	if config.BindDN != "" {
 		if err := connection.Bind(config.BindDN, config.BindPassword); err != nil {
 			writeError(w, 502, "LDAP 服务账号认证失败")
@@ -170,7 +176,7 @@ func (a *API) ldapSync(w http.ResponseWriter, r *http.Request) {
 		filter = strings.ReplaceAll(config.LoginFilter, "%s", "*")
 	}
 	request := ldap.NewSearchRequest(config.BaseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 20, false, filter, []string{config.UsernameAttr, config.DisplayNameAttr, config.EmailAttr}, nil)
-	result, err := connection.Search(request)
+	result, err := connection.SearchWithPaging(request, 500)
 	if err != nil {
 		writeError(w, 502, "LDAP 用户查询失败："+err.Error())
 		return
@@ -192,7 +198,7 @@ func (a *API) ldapSync(w http.ResponseWriter, r *http.Request) {
 		}
 		displayName := strings.TrimSpace(entry.GetAttributeValue(config.DisplayNameAttr))
 		email := strings.TrimSpace(entry.GetAttributeValue(config.EmailAttr))
-		tag, err := tx.Exec(r.Context(), `INSERT INTO users(username,display_name,email,role,source,ldap_dn,enabled) VALUES($1,$2,$3,'USER','LDAP',$4,true) ON CONFLICT (lower(username)) DO UPDATE SET display_name=excluded.display_name,email=excluded.email,ldap_dn=excluded.ldap_dn,enabled=true,updated_at=now() WHERE users.source='LDAP'`, username, displayName, email, entry.DN)
+		tag, err := tx.Exec(r.Context(), `INSERT INTO users(username,display_name,email,role,source,ldap_dn,enabled,ldap_directory_present) VALUES($1,$2,$3,'USER','LDAP',$4,true,true) ON CONFLICT (lower(username)) DO UPDATE SET display_name=excluded.display_name,email=excluded.email,ldap_dn=excluded.ldap_dn,ldap_directory_present=true,updated_at=now() WHERE users.source='LDAP'`, username, displayName, email, entry.DN)
 		if err != nil {
 			writeError(w, 500, err.Error())
 			return
@@ -204,11 +210,11 @@ func (a *API) ldapSync(w http.ResponseWriter, r *http.Request) {
 			skipped++
 		}
 	}
-	if _, err := tx.Exec(r.Context(), `UPDATE users SET enabled=false,updated_at=now() WHERE source='LDAP' AND NOT (lower(username)=ANY($1::text[]))`, syncedUsernames); err != nil {
+	if _, err := tx.Exec(r.Context(), `UPDATE users SET ldap_directory_present=false,updated_at=now() WHERE source='LDAP' AND NOT (lower(username)=ANY($1::text[]))`, syncedUsernames); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	if _, err := tx.Exec(r.Context(), `DELETE FROM user_sessions WHERE user_id IN (SELECT id FROM users WHERE source='LDAP' AND NOT enabled)`); err != nil {
+	if _, err := tx.Exec(r.Context(), `DELETE FROM user_sessions WHERE user_id IN (SELECT id FROM users WHERE source='LDAP' AND (NOT enabled OR NOT ldap_directory_present))`); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
@@ -219,24 +225,46 @@ func (a *API) ldapSync(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"synced": synced, "skipped": skipped, "found": len(result.Entries)})
 }
 
-func (a *API) authenticateLDAP(ctx context.Context, userDN, password string) error {
+func (a *API) authenticateLDAP(ctx context.Context, username, password string) error {
 	config, err := a.loadLDAPConfig(ctx)
 	if err != nil {
 		return err
 	}
-	if !config.Enabled() || userDN == "" || password == "" {
+	if !config.Enabled() || username == "" || password == "" {
 		return errors.New("LDAP 未配置或用户 DN 无效")
 	}
-	connection, err := openLDAP(config)
+	connection, cleanup, err := openLDAP(ctx, config)
 	if err != nil {
 		return err
 	}
-	defer connection.Close()
-	return connection.Bind(userDN, password)
+	defer cleanup()
+	return authenticateLDAPConnection(connection, config, username, password)
+}
+
+// 先按实际登录规则查找唯一用户，再验证该用户密码，不能信任旧同步 DN。
+func authenticateLDAPConnection(connection *ldap.Conn, config LDAPConfig, username, password string) error {
+	if config.BindDN != "" {
+		if err := connection.Bind(config.BindDN, config.BindPassword); err != nil {
+			return errors.New("LDAP 查询账号认证失败")
+		}
+	}
+	filter, err := ldapLoginFilter(config.LoginFilter, username)
+	if err != nil {
+		return err
+	}
+	result, err := connection.Search(ldap.NewSearchRequest(config.BaseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 2, 8, false, filter, []string{config.UsernameAttr}, nil))
+	if err != nil || len(result.Entries) != 1 {
+		return errors.New("LDAP 登录规则没有匹配唯一用户")
+	}
+	entry := result.Entries[0]
+	if entry.DN == "" || !strings.EqualFold(entry.GetAttributeValue(config.UsernameAttr), username) {
+		return errors.New("LDAP 登录规则返回的用户不匹配")
+	}
+	return connection.Bind(entry.DN, password)
 }
 
 func (a *API) loadLDAPConfig(ctx context.Context) (LDAPConfig, error) {
-	config := a.LDAP
+	config := LDAPConfig{}
 	var encryptedPassword []byte
 	err := a.Service.DB.QueryRow(ctx, `SELECT configured,enabled,url,start_tls,bind_dn,bind_password_ciphertext,base_dn,login_filter,sync_filter,username_attribute,display_name_attribute,email_attribute FROM ldap_settings WHERE singleton=true`).Scan(&config.Configured, &config.Active, &config.URL, &config.StartTLS, &config.BindDN, &encryptedPassword, &config.BaseDN, &config.LoginFilter, &config.SyncFilter, &config.UsernameAttr, &config.DisplayNameAttr, &config.EmailAttr)
 	if err != nil {
@@ -287,8 +315,14 @@ func validateLDAPConfig(config LDAPConfig) error {
 	if !strings.Contains(config.LoginFilter, "%s") {
 		return errors.New("登录过滤器必须包含 %s 用户名占位符")
 	}
+	if _, err := ldap.CompileFilter(strings.ReplaceAll(config.LoginFilter, "%s", ldap.EscapeFilter("validation"))); err != nil {
+		return errors.New("登录过滤器语法无效")
+	}
 	if config.SyncFilter == "" {
 		return errors.New("同步过滤器不能为空")
+	}
+	if _, err := ldap.CompileFilter(config.SyncFilter); err != nil {
+		return errors.New("同步过滤器语法无效")
 	}
 	for name, value := range map[string]string{"用户名属性": config.UsernameAttr, "显示名称属性": config.DisplayNameAttr, "邮箱属性": config.EmailAttr} {
 		if !ldapAttributePattern.MatchString(value) {
@@ -298,23 +332,53 @@ func validateLDAPConfig(config LDAPConfig) error {
 	return nil
 }
 
-func openLDAP(config LDAPConfig) (*ldap.Conn, error) {
+func openLDAP(ctx context.Context, config LDAPConfig) (*ldap.Conn, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	parsed, err := url.Parse(config.URL)
 	if err != nil || (parsed.Scheme != "ldap" && parsed.Scheme != "ldaps") {
-		return nil, errors.New("LDAP URL 必须使用 ldap:// 或 ldaps://")
+		return nil, nil, errors.New("LDAP URL 必须使用 ldap:// 或 ldaps://")
 	}
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: parsed.Hostname()}
-	connection, err := ldap.DialURL(config.URL, ldap.DialWithDialer(&netDialer), ldap.DialWithTLSConfig(tlsConfig))
-	if err != nil {
-		return nil, err
-	}
-	if config.StartTLS && parsed.Scheme == "ldap" {
-		if err := connection.StartTLS(tlsConfig); err != nil {
-			connection.Close()
-			return nil, err
+	port := parsed.Port()
+	if port == "" {
+		if parsed.Scheme == "ldaps" {
+			port = "636"
+		} else {
+			port = "389"
 		}
 	}
-	return connection, nil
+	address := net.JoinHostPort(parsed.Hostname(), port)
+	var transport net.Conn
+	if parsed.Scheme == "ldaps" {
+		transport, err = (&tls.Dialer{NetDialer: &netDialer, Config: tlsConfig}).DialContext(ctx, "tcp", address)
+	} else {
+		transport, err = netDialer.DialContext(ctx, "tcp", address)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	connection := ldap.NewConn(transport, parsed.Scheme == "ldaps")
+	connection.Start()
+	timeout := 8 * time.Second
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < timeout {
+		timeout = time.Until(deadline)
+	}
+	if timeout <= 0 {
+		connection.Close()
+		return nil, nil, context.DeadlineExceeded
+	}
+	connection.SetTimeout(timeout)
+	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	cleanup := func() { stop(); _ = connection.Close() }
+	if config.StartTLS && parsed.Scheme == "ldap" {
+		if err := connection.StartTLS(tlsConfig); err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+	}
+	return connection, cleanup, nil
 }
 
 func encryptSecret(key, plaintext []byte) ([]byte, error) {
@@ -361,5 +425,5 @@ func ldapLoginFilter(template, username string) (string, error) {
 	if !strings.Contains(template, "%s") {
 		return "", fmt.Errorf("LDAP 登录过滤器必须包含 %%s")
 	}
-	return fmt.Sprintf(template, ldap.EscapeFilter(username)), nil
+	return strings.ReplaceAll(template, "%s", ldap.EscapeFilter(username)), nil
 }

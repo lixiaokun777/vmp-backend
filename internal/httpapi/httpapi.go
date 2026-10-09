@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -20,7 +22,6 @@ import (
 type API struct {
 	Service               *platform.Service
 	BootstrapToken        string
-	AgentToken            string
 	SessionTTL            time.Duration
 	SessionSecure         bool
 	TrustedProxies        []netip.Prefix
@@ -54,6 +55,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/v1/hosts/{id}/status", a.hostStatus)
 	mux.HandleFunc("PATCH /api/v1/hosts/{id}/quota", a.hostQuota)
 	mux.HandleFunc("DELETE /api/v1/hosts/{id}", a.deleteHost)
+	mux.HandleFunc("POST /api/v1/hosts/{id}/credentials/rotate", a.rotateHostCredential)
+	mux.HandleFunc("POST /api/v1/hosts/{id}/credentials/revoke", a.revokeHostCredential)
 	mux.HandleFunc("GET /api/v1/flavors", a.flavors)
 	mux.HandleFunc("POST /api/v1/flavors", a.createFlavor)
 	mux.HandleFunc("PATCH /api/v1/flavors/{id}", a.updateFlavor)
@@ -89,6 +92,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/agents/{id}/console-sessions/{sessionID}/consume", a.consumeConsoleSession)
 	mux.HandleFunc("GET /api/v1/agents/{id}/tasks/next", a.agentTask)
 	mux.HandleFunc("POST /api/v1/agents/{id}/tasks/{taskID}/result", a.agentTaskResult)
+	mux.HandleFunc("POST /api/v1/agents/{id}/tasks/{taskID}/renew", a.renewAgentTaskLease)
 	if a.SessionTTL <= 0 {
 		a.SessionTTL = 12 * time.Hour
 	}
@@ -97,6 +101,8 @@ func (a *API) Handler() http.Handler {
 
 func withMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 总量上限覆盖 Agent 清单等大 JSON，登录和配置接口可继续使用更小上限。
+		r.Body = http.MaxBytesReader(w, r.Body, 8<<20)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		start := time.Now()
@@ -172,13 +178,13 @@ func (a *API) instances(w http.ResponseWriter, r *http.Request) {
 		args = append(args, user.Username)
 	}
 	where := " WHERE " + strings.Join(filters, " AND ")
-	a.queryListArgs(w, r, `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'host',h.name,'flavor',f.name,'image',im.name,'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'restore_count',i.restore_count,'created_at',i.created_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id`+where+` ORDER BY i.created_at DESC`, args...)
+	a.queryListArgs(w, r, `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'host',h.name,'flavor',i.flavor_name_snapshot,'flavor_id',a.flavor_id,'resource_snapshot',jsonb_build_object('cpu',i.allocated_cpu,'memory_mb',i.allocated_memory_mb,'disk_gb',i.allocated_disk_gb),'image',im.name,'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'restore_count',i.restore_count,'created_at',i.created_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id`+where+` ORDER BY i.created_at DESC`, args...)
 }
 
 func (a *API) instanceDetail(w http.ResponseWriter, r *http.Request) {
 	user, _ := userFromRequest(r)
 	var instance json.RawMessage
-	err := a.Service.DB.QueryRow(r.Context(), `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'purpose',a.purpose,'request_no',a.request_no,'host',h.name,'host_id',i.host_id,'flavor',jsonb_build_object('id',f.id,'name',f.name,'cpu',f.cpu,'memory_mb',f.memory_mb,'disk_gb',f.disk_gb),'image',jsonb_build_object('id',im.id,'name',im.name,'source_type',im.source_type,'source_location',im.source_location,'sync_status',im.sync_status),'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'provider_ref',i.provider_ref,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'restore_count',i.restore_count,'created_at',i.created_at,'updated_at',i.updated_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id WHERE i.id=$1::uuid AND ($3 OR a.applicant=$2)`, r.PathValue("id"), user.Username, user.Role == "ADMIN").Scan(&instance)
+	err := a.Service.DB.QueryRow(r.Context(), `SELECT jsonb_build_object('id',i.id,'name',i.name,'owner',a.applicant,'purpose',a.purpose,'request_no',a.request_no,'host',h.name,'host_id',i.host_id,'flavor_id',a.flavor_id,'resource_snapshot',jsonb_build_object('cpu',i.allocated_cpu,'memory_mb',i.allocated_memory_mb,'disk_gb',i.allocated_disk_gb),'flavor',jsonb_build_object('id',f.id,'name',i.flavor_name_snapshot,'cpu',i.allocated_cpu,'memory_mb',i.allocated_memory_mb,'disk_gb',i.allocated_disk_gb),'image',jsonb_build_object('id',im.id,'name',im.name,'source_type',im.source_type,'source_location',im.source_location,'sync_status',im.sync_status),'lifecycle_status',i.lifecycle_status,'provider_status',i.provider_status,'provider_ref',i.provider_ref,'ip_address',i.ip_address,'username',i.username,'expires_at',i.expires_at,'retention_until',i.retention_until,'restore_count',i.restore_count,'created_at',i.created_at,'updated_at',i.updated_at) FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN hosts h ON h.id=i.host_id WHERE i.id=$1::uuid AND ($3 OR a.applicant=$2)`, r.PathValue("id"), user.Username, user.Role == "ADMIN").Scan(&instance)
 	if err != nil {
 		writeError(w, 404, "instance not found")
 		return
@@ -595,13 +601,13 @@ func (a *API) hostStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 422, "unsupported host status")
 		return
 	}
-	tag, err := a.Service.DB.Exec(r.Context(), `UPDATE hosts SET status=$1,updated_at=now() WHERE id=$2::uuid`, in.Status, r.PathValue("id"))
+	tag, err := a.Service.DB.Exec(r.Context(), `UPDATE hosts h SET status=$1,updated_at=now() WHERE id=$2::uuid AND ($1<>'ACTIVE' OR EXISTS(SELECT 1 FROM host_credentials c WHERE c.host_id=h.id AND c.revoked_at IS NULL AND h.last_heartbeat_at>=c.updated_at))`, in.Status, r.PathValue("id"))
 	if err != nil {
 		writeError(w, 422, err.Error())
 		return
 	}
 	if tag.RowsAffected() == 0 {
-		writeError(w, 404, "host not found")
+		writeError(w, 422, "宿主机不存在，或独立凭据未就绪；重新签发后需确认新 Agent 心跳才能恢复调度")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"status": in.Status})
@@ -688,8 +694,8 @@ type flavorInput struct {
 
 func (a *API) createFlavor(w http.ResponseWriter, r *http.Request) {
 	var in flavorInput
-	if json.NewDecoder(r.Body).Decode(&in) != nil || in.ID == "" || in.Name == "" || in.CPU < 1 || in.MemoryMB < 512 || in.DiskGB < 10 {
-		writeError(w, 422, "invalid flavor")
+	if json.NewDecoder(r.Body).Decode(&in) != nil || !resourceIdentifierPattern.MatchString(in.ID) || in.Name == "" || in.CPU < 1 || in.MemoryMB < 512 || in.DiskGB < 10 {
+		writeError(w, 422, "规格信息无效；标识仅支持字母、数字、点、下划线和连字符，最多 64 字符")
 		return
 	}
 	_, err := a.Service.DB.Exec(r.Context(), `INSERT INTO flavors(id,name,cpu,memory_mb,disk_gb) VALUES($1,$2,$3,$4,$5)`, in.ID, in.Name, in.CPU, in.MemoryMB, in.DiskGB)
@@ -701,8 +707,8 @@ func (a *API) createFlavor(w http.ResponseWriter, r *http.Request) {
 }
 func (a *API) updateFlavor(w http.ResponseWriter, r *http.Request) {
 	var in flavorInput
-	if json.NewDecoder(r.Body).Decode(&in) != nil || in.Enabled == nil || in.Name == "" || in.CPU < 1 || in.MemoryMB < 512 || in.DiskGB < 10 {
-		writeError(w, 422, "name, cpu, memory_mb, disk_gb and enabled are required")
+	if !resourceIdentifierPattern.MatchString(r.PathValue("id")) || json.NewDecoder(r.Body).Decode(&in) != nil || in.Enabled == nil || in.Name == "" || in.CPU < 1 || in.MemoryMB < 512 || in.DiskGB < 10 {
+		writeError(w, 422, "规格标识或资源信息无效；需要名称、CPU、内存、磁盘和启用状态")
 		return
 	}
 	_, err := a.Service.DB.Exec(r.Context(), `UPDATE flavors SET name=$1,cpu=$2,memory_mb=$3,disk_gb=$4,enabled=$5 WHERE id=$6`, in.Name, in.CPU, in.MemoryMB, in.DiskGB, *in.Enabled, r.PathValue("id"))
@@ -714,6 +720,10 @@ func (a *API) updateFlavor(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deleteFlavor(w http.ResponseWriter, r *http.Request) {
+	if !resourceIdentifierPattern.MatchString(r.PathValue("id")) {
+		writeError(w, 422, "规格标识仅支持字母、数字、点、下划线和连字符，最多 64 字符")
+		return
+	}
 	tag, err := a.Service.DB.Exec(r.Context(), `DELETE FROM flavors f WHERE f.id=$1 AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.flavor_id=f.id)`, r.PathValue("id"))
 	if err != nil {
 		writeError(w, 409, err.Error())
@@ -739,11 +749,12 @@ type imageInput struct {
 }
 
 var imageFileNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
+var resourceIdentifierPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 
 func (a *API) createImage(w http.ResponseWriter, r *http.Request) {
 	var in imageInput
-	if json.NewDecoder(r.Body).Decode(&in) != nil || in.ID == "" || in.Name == "" || in.OSFamily == "" || in.Version == "" {
-		writeError(w, 422, "invalid image")
+	if json.NewDecoder(r.Body).Decode(&in) != nil || !resourceIdentifierPattern.MatchString(in.ID) || in.Name == "" || in.OSFamily == "" || in.Version == "" {
+		writeError(w, 422, "镜像信息无效；标识仅支持字母、数字、点、下划线和连字符，最多 64 字符")
 		return
 	}
 	if in.SourceType == "" {
@@ -786,6 +797,10 @@ func (a *API) createImage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, map[string]any{"id": in.ID})
 }
 func (a *API) updateImage(w http.ResponseWriter, r *http.Request) {
+	if !resourceIdentifierPattern.MatchString(r.PathValue("id")) {
+		writeError(w, 422, "镜像标识仅支持字母、数字、点、下划线和连字符，最多 64 字符")
+		return
+	}
 	var in imageInput
 	if json.NewDecoder(r.Body).Decode(&in) != nil || in.Enabled == nil {
 		writeError(w, 422, "enabled is required")
@@ -840,6 +855,10 @@ func (a *API) updateImage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deleteImage(w http.ResponseWriter, r *http.Request) {
+	if !resourceIdentifierPattern.MatchString(r.PathValue("id")) {
+		writeError(w, 422, "镜像标识仅支持字母、数字、点、下划线和连字符，最多 64 字符")
+		return
+	}
 	tag, err := a.Service.DB.Exec(r.Context(), `DELETE FROM images i WHERE i.id=$1 AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.image_id=i.id)`, r.PathValue("id"))
 	if err != nil {
 		writeError(w, 409, err.Error())
@@ -1006,27 +1025,11 @@ func (a *API) batchDecideApprovals(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) registerAgent(w http.ResponseWriter, r *http.Request) {
-	if !tokenOK(r, a.BootstrapToken, "X-Bootstrap-Token") {
-		writeError(w, 401, "invalid bootstrap token")
-		return
-	}
-	var in platform.HostRegistration
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeError(w, 400, "invalid JSON")
-		return
-	}
-	result, err := a.Service.RegisterHost(r.Context(), in)
-	if err != nil {
-		writeError(w, 422, err.Error())
-		return
-	}
-	result["runtime_token"] = a.AgentToken
-	writeJSON(w, 200, result)
+	a.registerScopedAgent(w, r)
 }
 
 func (a *API) agentHeartbeat(w http.ResponseWriter, r *http.Request) {
-	if !tokenOK(r, a.AgentToken, "Authorization") {
-		writeError(w, 401, "unauthorized")
+	if !a.authorizeAgent(w, r) {
 		return
 	}
 	var hb platform.Heartbeat
@@ -1042,8 +1045,7 @@ func (a *API) agentHeartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) agentTask(w http.ResponseWriter, r *http.Request) {
-	if !tokenOK(r, a.AgentToken, "Authorization") {
-		writeError(w, 401, "unauthorized")
+	if !a.authorizeAgent(w, r) {
 		return
 	}
 	task, err := a.Service.PollTask(r.Context(), r.PathValue("id"))
@@ -1059,8 +1061,7 @@ func (a *API) agentTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) agentTaskResult(w http.ResponseWriter, r *http.Request) {
-	if !tokenOK(r, a.AgentToken, "Authorization") {
-		writeError(w, 401, "unauthorized")
+	if !a.authorizeAgent(w, r) {
 		return
 	}
 	var result platform.TaskResult
@@ -1069,16 +1070,47 @@ func (a *API) agentTaskResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.Service.CompleteTask(r.Context(), r.PathValue("id"), r.PathValue("taskID"), result); err != nil {
-		writeError(w, 409, err.Error())
+		if errors.Is(err, platform.ErrTaskClaimConflict) {
+			writeError(w, 409, "任务领取凭据已失效或与当前执行不匹配")
+		} else {
+			writeError(w, 500, "任务结果保存失败，请重试")
+		}
 		return
 	}
 	writeJSON(w, 200, map[string]any{"accepted": true})
 }
 
+func (a *API) renewAgentTaskLease(w http.ResponseWriter, r *http.Request) {
+	if !a.authorizeAgent(w, r) {
+		return
+	}
+	var input struct {
+		ClaimToken string `json:"claim_token"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&input) != nil || input.ClaimToken == "" {
+		writeError(w, 422, "任务领取凭据无效")
+		return
+	}
+	until, err := a.Service.RenewTaskLease(r.Context(), r.PathValue("id"), r.PathValue("taskID"), input.ClaimToken)
+	if err != nil {
+		if errors.Is(err, platform.ErrTaskClaimConflict) {
+			writeError(w, 409, "任务领取凭据已失效或与当前执行不匹配")
+		} else {
+			writeError(w, 500, "任务执行租约续期失败，请重试")
+		}
+		return
+	}
+	writeJSON(w, 200, map[string]any{"lease_until": until})
+}
+
 func tokenOK(r *http.Request, want, header string) bool {
 	got := r.Header.Get(header)
 	got = strings.TrimPrefix(got, "Bearer ")
-	return want != "" && got == want
+	if want == "" {
+		return false
+	}
+	gotHash, wantHash := sha256.Sum256([]byte(got)), sha256.Sum256([]byte(want))
+	return subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) == 1
 }
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"error": message})

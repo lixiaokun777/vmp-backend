@@ -101,7 +101,7 @@ func auditMutationTarget(r *http.Request) (string, string, string, bool) {
 	case "hosts", "flavors", "images", "networks":
 		actionName := map[string]string{http.MethodPost: "create", http.MethodPatch: "update", http.MethodDelete: "delete"}[r.Method]
 		if len(parts) > 2 {
-			actionName = parts[2]
+			actionName = strings.Join(parts[2:], ".")
 		}
 		return parts[0] + "." + actionName, strings.TrimSuffix(parts[0], "s"), resourceID, true
 	default:

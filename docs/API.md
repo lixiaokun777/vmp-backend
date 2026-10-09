@@ -21,9 +21,22 @@
 - `GET/POST/PATCH/DELETE /api/v1/users`：管理员查询、创建、更新和删除用户。
 - `POST /api/v1/users/{id}/password`：管理员重置本地用户密码并清除其现有会话。
 - `GET /api/v1/ldap/status`、`PUT /api/v1/ldap/config`：管理员查看并保存 LDAP 配置，响应不返回绑定密码。
-- `POST /api/v1/ldap/test`、`POST /api/v1/ldap/sync`：管理员测试目录连接并同步用户。
+- `POST /api/v1/ldap/test`、`POST /api/v1/ldap/sync`：管理员测试目录连接并分页同步用户。`users.enabled` 为平台主动启停，`ldap_directory_present` 为目录存在状态；同步不会重新启用平台停用的账号。两者都允许才可登录或沿用会话。
+
+LDAP 登录使用已转义用户名和 `login_filter` 实际搜索 Base DN，必须唯一匹配且用户名属性一致，再以本次查询 DN 验证密码。零匹配、多匹配、跨用户结果均拒绝；不再按旧同步 DN 直接绑定。LDAP 连接、请求及调用方取消均有期限，目录服务无响应时会退出。
 
 除健康检查、登录和 Agent 通信外，所有接口均要求有效会话。管理员可访问全部平台管理接口；普通用户只可读取申请所需的规格、镜像和网络，提交申请，查看自己的审批单，并查看、续期、恢复或操作自己的实例。服务端不信任客户端传入的用户名。
+
+所有依赖 Cookie 会话的非 GET/HEAD 写请求必须额外携带 `X-VMP-Request: 1`，缺失或不匹配返回 403 中文安全校验提示。平台前端自动设置；自行调用 API 的 curl/脚本必须显式设置，不要放宽 CORS 或移除校验来兼容旧脚本。健康检查、普通 GET/HEAD 读取和 Agent 的引导/独立 Bearer 通信不受此头要求影响。
+
+管理员 Cookie 写接口调用示例（cookie 文件需受限保存，凭据响应不要输出到共享日志）：
+
+```bash
+curl -sS -b /受限路径/session.cookies \
+  -H 'Content-Type: application/json' \
+  -H 'X-VMP-Request: 1' \
+  -X POST 'https://平台域名/api/v1/ldap/sync'
+```
 
 ## 业务接口
 
@@ -32,13 +45,13 @@
 - `GET /api/v1/hosts`、`PATCH /api/v1/hosts/{id}/status`：宿主机列表和状态管理。默认只返回真实宿主机；`GET /api/v1/hosts?all=1` 可用于开发诊断并包含 mock 节点。
 - `PATCH /api/v1/hosts/{id}/quota`：在 Agent 安全上限内设置平台 CPU、内存和磁盘调度配额。
 - `DELETE /api/v1/hosts/{id}`：删除已离线且没有未释放实例和执行中任务的宿主机纳管记录，不操作外部虚机。
-- `GET/POST/PATCH/DELETE /api/v1/flavors`：资源规格管理。已被申请记录引用的规格只能停用。
+- `GET/POST/PATCH/DELETE /api/v1/flavors`：资源规格管理。规格/镜像标识必须以字母或数字开头，仅支持字母、数字、点、下划线和连字符，最长 64 字符。被引用的规格可编辑用于未来申请，但既有实例资源快照不变，不能删除仍被申请记录引用的规格。
 - `GET/POST/PATCH/DELETE /api/v1/images`：镜像元数据管理。删除只移除平台元数据，不删除宿主机镜像文件；已被引用的镜像只能停用。`PATCH` 可编辑名称、系统版本和来源字段。本地镜像提供 `source_location`，Agent 强制其位于 `KVM_IMAGE_ROOT` 内；远程镜像提供 HTTP(S) URL 和 SHA-256，创建或修改来源后状态为 `PENDING`。
 - `GET/POST/PATCH/DELETE /api/v1/networks`：管理员同时定义网段、网关、DNS、Bridge 和唯一有效的 `ip_range_start` / `ip_range_end`。修改范围会事务性替换旧的空闲地址池；新范围之外存在已分配、预留或隔离地址时拒绝修改。仍有非空闲 IP 的网络不能删除。
 - `POST/DELETE /api/v1/networks/{id}/ip-ranges`：兼容旧客户端的地址池增删接口；Web 管理端统一通过网络编辑接口维护唯一范围。
 - `GET /api/v1/ip-addresses`：查询 IP 资源池。
 - `POST /api/v1/applications`：提交虚拟机申请。租期不超过 168 小时自动调度，并在 `connection` 中返回 IP、用户名和仅显示一次的初始密码；超过 168 小时返回 `approval_required=true`，批准前不预占资源。
-- `GET /api/v1/instances`：活动实例列表；已完成删除的实例不会返回。`scope=mine` 仅查询当前用户。默认排除 mock 节点的开发数据，诊断时可增加 `all=1`。
+- `GET /api/v1/instances`：活动实例列表；已完成删除的实例不会返回。`scope=mine` 仅查询当前用户。返回 `flavor_id`、创建时的 `flavor` 名称和 `resource_snapshot={cpu,memory_mb,disk_gb}`，不使用当前规格配置覆盖既有实例。默认排除 mock 节点的开发数据，诊断时可增加 `all=1`。
 - `GET /api/v1/instances/{id}`：实例配置、租期、任务历史和审计记录。
 - `POST /api/v1/instances/{id}/actions`：提交 `start`、`stop`、`reboot`、`reset_password`、`retry`、`release` 或 `force_delete` 操作。`reset_password` 仅允许运行中实例，响应返回只显示一次的新密码，任务负载只保存密码摘要。普通释放保留磁盘和原 IP 7 天；`force_delete` 跳过保留期。删除任务成功后释放 IP 和宿主机配额，并清除实例、申请、任务与对应审计展示记录。`retry` 仅用于重试已达失败上限的创建任务。
 - `POST /api/v1/instances/{id}/renew`：按小时续期，允许 1-720 小时并必须填写 `reason`；超过 168 小时进入审批。
@@ -54,10 +67,15 @@
 
 ## Agent 接口
 
-- `POST /api/v1/agents/register`：引导令牌认证，返回宿主机标识。
-- `POST /api/v1/agents/{id}/heartbeat`：上报宿主机事实、检查项和域清单。
-- `GET /api/v1/agents/{id}/tasks/next`：领取待执行任务。
-- `POST /api/v1/agents/{id}/tasks/{taskID}/result`：上报任务结果。
+- `POST /api/v1/agents/register`：新的唯一宿主名称用 `X-Bootstrap-Token` 首次纳管，返回 `id/name/status/runtime_token`，独立运行凭据只返回一次。已有名称必须用 `Authorization: Bearer <该宿主运行凭据>` 恢复纳管，响应不重新返回或修改凭据；可携带 `host_id` 加验，bootstrap 不可接管旧宿主。
+- `POST /api/v1/agents/{id}/heartbeat`：独立宿主身份上报事实、检查项和域清单。
+- `GET /api/v1/agents/{id}/tasks/next`：独立宿主身份领取待执行任务，返回 `claim_token` 和 `lease_until` 执行租约。
+- `POST /api/v1/agents/{id}/tasks/{taskID}/renew`：以 `{claim_token}` 为当前执行续租，返回 `{lease_until}`。旧/冲突领取凭据返回 409。
+- `POST /api/v1/agents/{id}/tasks/{taskID}/result`：以当前 `claim_token` 上报结果；相同已确认结果可重试，冲突或旧领取凭据返回 409，保存失败返回 500，可继续重试。
+- `POST /api/v1/hosts/{id}/credentials/rotate`：管理员签发/轮换该宿主独立凭据，返回 `host_id/name/runtime_token/generation`。旧凭据立即失效，新值仅返回一次；宿主暂停新增调度，更新 Agent 并确认心跳后再手动恢复。
+- `POST /api/v1/hosts/{id}/credentials/revoke`：管理员吊销宿主身份并暂停新增调度，不操作已有虚拟机。
+
+所有 Agent 任务、心跳及控制台核销接口均按独立凭据绑定 URL `{id}`，无全局运行令牌回退。跨宿主、无效/已吊销凭据返回 401；普通用户不能轮换或吊销。数据库仅存 SHA-256 摘要；旧宿主升级步骤见 [身份与凭据加固](身份与凭据加固.md)。
 
 ## 创建任务负载
 

@@ -124,10 +124,10 @@ func TestLoginProtectionDatabase(t *testing.T) {
 	if err = pool.QueryRow(ctx, "SELECT attempts FROM login_attempt_buckets WHERE bucket_key='reset'").Scan(&count); err != nil || count != 2 {
 		t.Fatal("成功抹掉并发失败", err)
 	}
-	if _, err = pool.Exec(ctx, `CREATE TABLE users(id uuid,username text,display_name text,email text,role text,source text,enabled boolean,must_change_password boolean,ldap_dn text,password_hash text,last_login_at timestamptz,updated_at timestamptz);
+	if _, err = pool.Exec(ctx, `CREATE TABLE users(id uuid,username text,display_name text,email text,role text,source text,enabled boolean,must_change_password boolean,ldap_dn text,password_hash text,last_login_at timestamptz,updated_at timestamptz,ldap_directory_present boolean DEFAULT true);
  CREATE TABLE user_sessions(token_hash bytea,user_id uuid,expires_at timestamptz,remote_address text,user_agent text);
  CREATE TABLE audit_logs(actor text,action text,resource_type text,resource_id text,detail jsonb,outcome text,source_ip text,user_agent text,request_id text);
- INSERT INTO users VALUES('00000000-0000-0000-0000-000000000001','valid-user','测试用户','','USER','LOCAL',true,false,'',crypt('TestPassword123!',gen_salt('bf',4)),NULL,now());`); err != nil {
+ INSERT INTO users VALUES('00000000-0000-0000-0000-000000000001','valid-user','测试用户','','USER','LOCAL',true,false,'',crypt('TestPassword123!',gen_salt('bf',4)),NULL,now(),true);`); err != nil {
 		t.Fatal(err)
 	}
 	login := func(username, password, source, ip, forward string) *httptest.ResponseRecorder {
