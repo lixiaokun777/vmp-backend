@@ -1,0 +1,45 @@
+name: 后端回归验证
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: vmp_test
+          POSTGRES_PASSWORD: LocalRegressionOnly2026
+          POSTGRES_DB: vmp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vmp_test -d vmp_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      VMP_TEST_DATABASE_URL: postgres://vmp_test:LocalRegressionOnly2026@127.0.0.1:5432/vmp_test?sslmode=disable
+      PGPASSWORD: LocalRegressionOnly2026
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: 初始化专用测试数据库扩展
+        # 多包测试各自建临时 schema，扩展必须在公共测试 schema，不能随某一测试清理。
+        run: psql -h 127.0.0.1 -U vmp_test -d vmp_test -c 'CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;'
+      - name: 数据库、故障恢复与并发回归
+        run: go test -race -count=1 ./...
+      - name: 静态检查
+        run: go vet ./...

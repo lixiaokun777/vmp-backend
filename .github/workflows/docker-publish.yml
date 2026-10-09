@@ -10,7 +10,10 @@ permissions:
   contents: read
 
 jobs:
+  verify:
+    uses: ./.github/workflows/test.yml
   publish:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - name: 检出源码

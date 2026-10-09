@@ -16,7 +16,17 @@ const approvalThresholdHours = 7 * 24
 
 var instanceNamePattern = regexp.MustCompile(`^[a-zA-Z0-9-]{1,48}$`)
 
+func validateCreateInput(in CreateApplicationInput) error {
+	if !instanceNamePattern.MatchString(in.InstanceName) || strings.TrimSpace(in.Purpose) == "" || in.FlavorID == "" || in.ImageID == "" || in.LeaseHours < 1 || in.LeaseHours > 720 {
+		return errors.New("申请参数无效：名称仅支持 1-48 位字母、数字、连字符，请填写用途并选择 1-720 小时租期")
+	}
+	return nil
+}
+
 func (s *Service) CreateApplication(ctx context.Context, actor string, in CreateApplicationInput) (map[string]any, error) {
+	if err := validateCreateInput(in); err != nil {
+		return nil, err
+	}
 	if in.LeaseHours <= approvalThresholdHours {
 		return s.createApplicationNow(ctx, actor, in)
 	}
@@ -118,10 +128,21 @@ func (s *Service) restoreInstanceNow(ctx context.Context, actor string, administ
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	result, err := s.restoreInstanceTx(ctx, tx, actor, administrator, instanceID, hours, reason)
+	if err != nil {
+		return nil, err
+	}
+	return result, tx.Commit(ctx)
+}
+
+func (s *Service) restoreInstanceTx(ctx context.Context, tx pgx.Tx, actor string, administrator bool, instanceID string, hours int, reason string) (map[string]any, error) {
+	if !uuidPattern.MatchString(instanceID) || hours < 1 || hours > 720 || strings.TrimSpace(reason) == "" {
+		return nil, errors.New("实例、恢复小时或恢复原因无效")
+	}
 	var owner, hostID, name, lifecycleStatus string
 	var restoreCount int
 	var retentionUntil *time.Time
-	err = tx.QueryRow(ctx, `SELECT a.applicant,i.host_id::text,i.name,i.lifecycle_status,i.retention_until,i.restore_count FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &hostID, &name, &lifecycleStatus, &retentionUntil, &restoreCount)
+	err := tx.QueryRow(ctx, `SELECT a.applicant,i.host_id::text,i.name,i.lifecycle_status,i.retention_until,i.restore_count FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &hostID, &name, &lifecycleStatus, &retentionUntil, &restoreCount)
 	if err != nil {
 		return nil, err
 	}
@@ -150,9 +171,6 @@ func (s *Service) restoreInstanceNow(ctx context.Context, actor string, administ
 	}
 	detail, _ := json.Marshal(map[string]any{"hours": hours, "reason": reason, "expires_at": expiresAt, "original_ip_retained": true})
 	_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.restore','instance',$2,$3)`, actor, instanceID, detail)
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
 	return map[string]any{"id": instanceID, "status": "STARTING", "expires_at": expiresAt, "approval_required": false}, nil
 }
 
@@ -161,10 +179,11 @@ func (s *Service) DecideApproval(ctx context.Context, reviewer, approvalID, deci
 	if !uuidPattern.MatchString(approvalID) || (decision != "APPROVE" && decision != "REJECT") {
 		return nil, errors.New("审批参数无效")
 	}
-	tx, err := s.DB.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	tx, err := s.DB.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
+	defer tx.Rollback(ctx)
 	var requestType, applicant, instanceID string
 	var requestedHours int
 	var payload []byte
@@ -203,14 +222,12 @@ func (s *Service) DecideApproval(ctx context.Context, reviewer, approvalID, deci
 		}
 		return map[string]any{"id": approvalID, "status": "REJECTED"}, nil
 	}
-	if _, err := tx.Exec(ctx, `UPDATE approval_requests SET status='PROCESSING',reviewer=$1,review_comment=$2,reviewed_at=now(),updated_at=now() WHERE id=$3::uuid`, reviewer, comment, approvalID); err != nil {
-		tx.Rollback(ctx)
+	// 审批、资源变更和 Agent 任务同事务提交；崩溃时整体回滚，绝不留下 PROCESSING 半成品。
+	// 保存点只用于隔离业务失败，失败审批仍能与审批意见一起持久化。
+	executionTx, err := tx.Begin(ctx)
+	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-
 	var result map[string]any
 	switch requestType {
 	case "CREATE":
@@ -219,17 +236,32 @@ func (s *Service) DecideApproval(ctx context.Context, reviewer, approvalID, deci
 		if err != nil {
 			err = errors.New("创建申请负载无效")
 		} else {
-			result, err = s.createApplicationNow(ctx, applicant, input)
+			result, err = s.createApplicationTx(ctx, executionTx, applicant, input)
 		}
 	case "RENEW":
-		result, err = s.renewInstanceNow(ctx, applicant, true, instanceID, requestedHours, "审批通过："+comment)
+		result, err = s.renewInstanceTx(ctx, executionTx, applicant, true, instanceID, requestedHours, "审批通过："+comment)
 	case "RESTORE":
-		result, err = s.restoreInstanceNow(ctx, applicant, true, instanceID, requestedHours, "审批通过："+comment)
+		result, err = s.restoreInstanceTx(ctx, executionTx, applicant, true, instanceID, requestedHours, "审批通过："+comment)
 	default:
 		err = errors.New("不支持的审批类型")
 	}
 	if err != nil {
-		_, _ = s.DB.Exec(ctx, `UPDATE approval_requests SET status='FAILED',result=jsonb_build_object('error',$1),updated_at=now() WHERE id=$2::uuid`, err.Error(), approvalID)
+		executionErr := err
+		if rollbackErr := executionTx.Rollback(ctx); rollbackErr != nil {
+			return nil, rollbackErr
+		}
+		if _, err = tx.Exec(ctx, `UPDATE approval_requests SET status='FAILED',reviewer=$1,review_comment=$2,reviewed_at=now(),result=jsonb_build_object('error',$3::text),updated_at=now() WHERE id=$4::uuid`, reviewer, comment, executionErr.Error(), approvalID); err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,outcome,detail) VALUES($1,'approval.approve','approval',$2,'FAILED',jsonb_build_object('error',$3::text,'approved_hours',$4::integer))`, reviewer, approvalID, executionErr.Error(), requestedHours); err != nil {
+			return nil, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return nil, executionErr
+	}
+	if err = executionTx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	delete(result, "connection")
@@ -240,13 +272,15 @@ func (s *Service) DecideApproval(ctx context.Context, reviewer, approvalID, deci
 	} else if value, ok := result["id"].(string); ok {
 		resultInstanceID = value
 	}
-	_, err = s.DB.Exec(ctx, `UPDATE approval_requests SET status='APPROVED',instance_id=nullif($1,'')::uuid,result=$2,updated_at=now() WHERE id=$3::uuid`, resultInstanceID, resultPayload, approvalID)
+	_, err = tx.Exec(ctx, `UPDATE approval_requests SET status='APPROVED',instance_id=nullif($1,'')::uuid,result=$2,reviewer=$3,review_comment=$4,reviewed_at=now(),updated_at=now() WHERE id=$5::uuid`, resultInstanceID, resultPayload, reviewer, comment, approvalID)
 	if err != nil {
 		return nil, err
 	}
 	detail, _ := json.Marshal(map[string]any{"request_type": requestType, "applicant": applicant, "comment": comment, "approved_hours": requestedHours})
-	_, _ = s.DB.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'approval.approve','approval',$2,$3)`, reviewer, approvalID, detail)
-	return map[string]any{"id": approvalID, "status": "APPROVED", "result": result}, nil
+	if _, err = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'approval.approve','approval',$2,$3)`, reviewer, approvalID, detail); err != nil {
+		return nil, err
+	}
+	return map[string]any{"id": approvalID, "status": "APPROVED", "result": result}, tx.Commit(ctx)
 }
 
 func decodeCreateApprovalPayload(payload []byte, approvedHours int) (CreateApplicationInput, error) {
@@ -279,12 +313,16 @@ func (s *Service) ResubmitApprovalShort(ctx context.Context, actor string, admin
 	}
 	var requestType, applicant, instanceID string
 	var payload []byte
-	err := s.DB.QueryRow(ctx, `SELECT request_type,applicant,coalesce(instance_id::text,''),payload FROM approval_requests WHERE id=$1::uuid AND status IN ('REJECTED','EXPIRED','FAILED','WITHDRAWN')`, approvalID).Scan(&requestType, &applicant, &instanceID, &payload)
+	var uncertain bool
+	err := s.DB.QueryRow(ctx, `SELECT request_type,applicant,coalesce(instance_id::text,''),payload,coalesce((result->>'execution_uncertain')::boolean,false) FROM approval_requests WHERE id=$1::uuid AND status IN ('REJECTED','EXPIRED','FAILED','WITHDRAWN')`, approvalID).Scan(&requestType, &applicant, &instanceID, &payload, &uncertain)
 	if err != nil {
 		return nil, errors.New("只有被拒绝、超时、执行失败或已撤回的审批单可以改为短租期重提")
 	}
 	if applicant != actor && !administrator {
 		return nil, errors.New("审批单不属于当前用户")
+	}
+	if uncertain {
+		return nil, errors.New("旧版本审批执行结果不确定，请管理员先核查关联实例和审计流水，禁止直接重提")
 	}
 	var result map[string]any
 	switch requestType {

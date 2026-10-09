@@ -6,6 +6,9 @@ VMP 虚拟机申领平台的控制面。负责资源规格、镜像、网络 IP�
 
 ## 当前能力
 
+- 当前未发布 P1 源码修复、兼容协议和测试见 [P1 修复与验收](docs/P1修复与验收.md)，旧 Docker 固定镜像尚不包含这些变更。
+- 每宿主独立身份、任务租约/确认回执、分配快照、原子审批与 LDAP 范围控制已接入；旧环境必须配套升级三个组件，见 [凭据升级](docs/身份与凭据加固.md)。
+
 - 本地与 LDAP 登录提供持久化账号冷却、来源 IP 限流和可信代理校验。详见 [登录保护](docs/登录保护.md)。
 
 - 管理员配置 WPS / WOA 群机器人，提醒租期、保留期和最终删除，提供记录、重试与加密配置。详见 [群通知](docs/群通知.md)。
@@ -33,12 +36,16 @@ VMP 虚拟机申领平台的控制面。负责资源规格、镜像、网络 IP�
 
 ## 快速启动
 
-开源部署只需要克隆本仓库，默认直接拉取 Docker Hub 上经过标记的控制面和前端镜像：
+正式已发布版本可按部署指南拉取固定镜像。当前未发布 P1 分支须准备同级前端并使用源码构建，不能只拉旧固定镜像就认为已应用修复：
 
 ```bash
 cp .env.example .env
 chmod 600 .env
-docker compose --env-file .env -f deployments/compose/compose.yaml up -d
+# 编辑 .env：填写随机引导令牌、管理员/数据库密码及独立加密/控制台密钥。
+# 引导令牌可用 openssl rand -hex 32 生成，公开示例值会拒绝启动。
+VMP_BACKEND_IMAGE=vmp-backend:p1-local VMP_FRONTEND_IMAGE=vmp-frontend:p1-local \
+  docker compose --env-file .env -f deployments/compose/compose.yaml \
+  -f deployments/compose/compose.build.yaml up -d --build
 curl http://127.0.0.1:8080/api/v1/health
 ```
 
@@ -50,6 +57,10 @@ curl http://127.0.0.1:8080/api/v1/health
 
 ```bash
 go test ./...
+# 设置专用 VMP_TEST_DATABASE_URL 才会执行数据库集成回归。
+go test -race -count=1 ./...
+go vet ./...
+# 启动必须提供随机 AGENT_BOOTSTRAP_TOKEN，不再回退公开开发值。
 go run ./cmd/control-plane
 ```
 

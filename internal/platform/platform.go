@@ -85,6 +85,7 @@ type Check struct {
 }
 
 type TaskResult struct {
+	ClaimToken  string `json:"claim_token,omitempty"`
 	Success     bool   `json:"success"`
 	ProviderRef string `json:"provider_ref"`
 	IPAddress   string `json:"ip_address"`
@@ -109,20 +110,27 @@ func New(ctx context.Context, databaseURL string) (*Service, error) {
 }
 
 func (s *Service) createApplicationNow(ctx context.Context, actor string, in CreateApplicationInput) (map[string]any, error) {
-	if in.InstanceName == "" || in.Purpose == "" || in.FlavorID == "" || in.ImageID == "" {
-		return nil, errors.New("instance_name, purpose, flavor_id and image_id are required")
-	}
-	if in.LeaseHours < 1 || in.LeaseHours > 720 {
-		return nil, errors.New("lease_hours must be between 1 and 720")
-	}
 	tx, err := s.DB.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	result, err := s.createApplicationTx(ctx, tx, actor, in)
+	if err != nil {
+		return nil, err
+	}
+	return result, tx.Commit(ctx)
+}
+
+// createApplicationTx 只在调用方事务中预占资源和写任务，审批结果可与执行一起原子提交。
+func (s *Service) createApplicationTx(ctx context.Context, tx pgx.Tx, actor string, in CreateApplicationInput) (map[string]any, error) {
+	if err := validateCreateInput(in); err != nil {
+		return nil, err
+	}
 
 	var cpu, memoryMB, diskGB int
-	if err := tx.QueryRow(ctx, `SELECT cpu, memory_mb, disk_gb FROM flavors WHERE id=$1 AND enabled`, in.FlavorID).Scan(&cpu, &memoryMB, &diskGB); err != nil {
+	var flavorName string
+	if err := tx.QueryRow(ctx, `SELECT cpu, memory_mb, disk_gb,name FROM flavors WHERE id=$1 AND enabled FOR SHARE`, in.FlavorID).Scan(&cpu, &memoryMB, &diskGB, &flavorName); err != nil {
 		return nil, fmt.Errorf("invalid flavor: %w", err)
 	}
 	var imageName, imageFile, imagePath, osFamily string
@@ -131,7 +139,7 @@ func (s *Service) createApplicationNow(ctx context.Context, actor string, in Cre
 	}
 
 	var hostID, hostName string
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT id::text, name FROM hosts
 		WHERE status='ACTIVE'
 		  AND agent_mode <> 'kvm-readonly'
@@ -157,9 +165,9 @@ func (s *Service) createApplicationNow(ctx context.Context, actor string, in Cre
 	}
 	var instanceID string
 	err = tx.QueryRow(ctx, `
-		INSERT INTO instances(application_id, host_id, name, lifecycle_status, expires_at)
-		VALUES ($1::uuid,$2::uuid,$3,'PROVISIONING',now()+make_interval(hours=>$4))
-		RETURNING id::text`, appID, hostID, in.InstanceName, in.LeaseHours).Scan(&instanceID)
+		INSERT INTO instances(application_id, host_id, name, lifecycle_status, expires_at,allocated_cpu,allocated_memory_mb,allocated_disk_gb,flavor_name_snapshot)
+		VALUES ($1::uuid,$2::uuid,$3,'PROVISIONING',now()+make_interval(hours=>$4),$5,$6,$7,$8)
+		RETURNING id::text`, appID, hostID, in.InstanceName, in.LeaseHours, cpu, memoryMB, diskGB, flavorName).Scan(&instanceID)
 	if err != nil {
 		return nil, err
 	}
@@ -214,9 +222,6 @@ func (s *Service) createApplicationNow(ctx context.Context, actor string, in Cre
 	}
 	auditDetail, _ := json.Marshal(map[string]any{"instance_id": instanceID, "host_id": hostID, "image_id": in.ImageID, "network_id": in.NetworkID, "ip_address": ipAddress})
 	_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES ($1,'application.create','application',$2,$3)`, actor, appID, auditDetail)
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
 	return map[string]any{"id": appID, "request_no": requestNo, "instance_id": instanceID, "host": hostName, "status": "APPROVED", "connection": map[string]any{"ip_address": ipAddress, "username": username, "password": password, "available_after_provisioning": true}}, nil
 }
 
@@ -438,44 +443,32 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 		return map[string]any{"id": instanceID, "status": "PROVISIONING", "task_type": "CREATE_INSTANCE"}, nil
 	}
 	if action == "release" {
-		if restoreCount >= 1 {
-			if lifecycleStatus != "RUNNING" && lifecycleStatus != "STOPPED" {
-				return nil, fmt.Errorf("instance cannot be released from status %s", lifecycleStatus)
-			}
-			if err := insertInstanceTask(ctx, tx, "DELETE_INSTANCE", instanceID, hostID, name, "release-after-restore"); err != nil {
-				return nil, err
-			}
-			if _, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='DELETING',retention_until=now(),updated_at=now() WHERE id=$1::uuid`, instanceID); err != nil {
-				return nil, err
-			}
-			_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.release','instance',$2,'{"retention_days":0,"reason":"restore_limit_reached"}'::jsonb)`, actor, instanceID)
-			if err := tx.Commit(ctx); err != nil {
-				return nil, err
-			}
-			return map[string]any{"id": instanceID, "status": "DELETING", "retention_days": 0, "task_type": "DELETE_INSTANCE"}, nil
+		var activeTasks int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE resource_id=$1::uuid AND status IN ('PENDING','RUNNING')`, instanceID).Scan(&activeTasks); err != nil {
+			return nil, err
 		}
-		switch lifecycleStatus {
-		case "RUNNING":
-			if err := insertInstanceTask(ctx, tx, "STOP_INSTANCE", instanceID, hostID, name, "manual-release"); err != nil {
+		if activeTasks > 0 {
+			return nil, errors.New("实例仍有任务正在执行，请等待完成后释放")
+		}
+		releaseAt := time.Now().UTC()
+		if expiresAt.Before(releaseAt) {
+			releaseAt = expiresAt
+		}
+		retentionUntil := releaseAt.Add(retentionDuration)
+		if lifecycleStatus == "RETAINED" {
+			if err := tx.QueryRow(ctx, `SELECT retention_until FROM instances WHERE id=$1::uuid`, instanceID).Scan(&retentionUntil); err != nil {
 				return nil, err
 			}
-			lifecycleStatus = "STOPPING"
-		case "STOPPED":
-			lifecycleStatus = "RETAINED"
-		case "RETAINED":
-			return map[string]any{"id": instanceID, "status": lifecycleStatus}, tx.Commit(ctx)
-		default:
-			return nil, fmt.Errorf("instance cannot be released from status %s", lifecycleStatus)
 		}
-		_, err = tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,expires_at=least(expires_at,now()),retention_until=now()+interval '7 days',updated_at=now() WHERE id=$2::uuid`, lifecycleStatus, instanceID)
+		result, err := s.releaseInstanceTx(ctx, tx, instanceID, hostID, name, lifecycleStatus, restoreCount, retentionUntil, "manual-release")
 		if err != nil {
 			return nil, err
 		}
-		_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.release','instance',$2,$3)`, actor, instanceID, []byte(`{"retention_days":7}`))
-		if err := tx.Commit(ctx); err != nil {
+		detail, _ := json.Marshal(map[string]any{"retention_days": result["retention_days"], "restore_count": restoreCount})
+		if _, err := tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.release','instance',$2,$3)`, actor, instanceID, detail); err != nil {
 			return nil, err
 		}
-		return map[string]any{"id": instanceID, "status": lifecycleStatus, "retention_days": 7}, nil
+		return result, tx.Commit(ctx)
 	}
 	if action == "force_delete" {
 		if lifecycleStatus == "RELEASED" {
@@ -528,16 +521,24 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 }
 
 func (s *Service) renewInstanceNow(ctx context.Context, actor string, administrator bool, instanceID string, hours int, reason string) (map[string]any, error) {
-	if !uuidPattern.MatchString(instanceID) || hours < 1 || hours > 720 {
-		return nil, errors.New("instance id or renewal hours is invalid")
-	}
 	tx, err := s.DB.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	result, err := s.renewInstanceTx(ctx, tx, actor, administrator, instanceID, hours, reason)
+	if err != nil {
+		return nil, err
+	}
+	return result, tx.Commit(ctx)
+}
+
+func (s *Service) renewInstanceTx(ctx context.Context, tx pgx.Tx, actor string, administrator bool, instanceID string, hours int, reason string) (map[string]any, error) {
+	if !uuidPattern.MatchString(instanceID) || hours < 1 || hours > 720 || strings.TrimSpace(reason) == "" {
+		return nil, errors.New("实例、续期小时或续期原因无效")
+	}
 	var owner, lifecycleStatus string
-	err = tx.QueryRow(ctx, `SELECT a.applicant,i.lifecycle_status FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &lifecycleStatus)
+	err := tx.QueryRow(ctx, `SELECT a.applicant,i.lifecycle_status FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &lifecycleStatus)
 	if err != nil {
 		return nil, err
 	}
@@ -557,9 +558,6 @@ func (s *Service) renewInstanceNow(ctx context.Context, actor string, administra
 	}
 	detail, _ := json.Marshal(map[string]any{"hours": hours, "reason": reason, "expires_at": expiresAt})
 	_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.renew','instance',$2,$3)`, actor, instanceID, detail)
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
 	return map[string]any{"id": instanceID, "status": lifecycleStatus, "expires_at": expiresAt}, nil
 }
 
@@ -578,13 +576,22 @@ func (s *Service) PollTask(ctx context.Context, hostID string) (map[string]any, 
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	var id, typ string
+	// 同一宿主的领取串行化，避免两个连接同时取得不同任务并发操作 libvirt。
+	var mode string
+	if err := tx.QueryRow(ctx, `SELECT agent_mode FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&mode); err != nil {
+		return nil, err
+	}
+	if mode == "kvm-readonly" {
+		return nil, pgx.ErrNoRows
+	}
+	var id, typ, claimToken string
+	var leaseUntil time.Time
 	var payload []byte
-	err = tx.QueryRow(ctx, `SELECT t.id::text,t.task_type,t.payload FROM tasks t JOIN hosts h ON h.id=t.host_id WHERE t.host_id=$1::uuid AND h.agent_mode <> 'kvm-readonly' AND t.status='PENDING' AND t.available_at<=now() ORDER BY t.created_at FOR UPDATE OF t SKIP LOCKED LIMIT 1`, hostID).Scan(&id, &typ, &payload)
+	err = tx.QueryRow(ctx, `SELECT t.id::text,t.task_type,t.payload FROM tasks t WHERE t.host_id=$1::uuid AND t.status='PENDING' AND t.available_at<=now() AND NOT EXISTS(SELECT 1 FROM tasks running WHERE running.host_id=t.host_id AND running.status='RUNNING') ORDER BY t.created_at FOR UPDATE OF t SKIP LOCKED LIMIT 1`, hostID).Scan(&id, &typ, &payload)
 	if err != nil {
 		return nil, err
 	}
-	_, err = tx.Exec(ctx, `UPDATE tasks SET status='RUNNING',attempt=attempt+1,claimed_at=now(),updated_at=now() WHERE id=$1::uuid`, id)
+	err = tx.QueryRow(ctx, `UPDATE tasks SET status='RUNNING',attempt=attempt+1,claimed_at=now(),claim_token=encode(gen_random_bytes(32),'hex'),lease_until=now()+interval '60 seconds',updated_at=now() WHERE id=$1::uuid RETURNING claim_token,lease_until`, id).Scan(&claimToken, &leaseUntil)
 	if err != nil {
 		return nil, err
 	}
@@ -593,7 +600,7 @@ func (s *Service) PollTask(ctx context.Context, hostID string) (map[string]any, 
 	}
 	var body any
 	_ = json.Unmarshal(payload, &body)
-	return map[string]any{"id": id, "type": typ, "payload": body}, nil
+	return map[string]any{"id": id, "type": typ, "payload": body, "claim_token": claimToken, "lease_until": leaseUntil}, nil
 }
 
 func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, result TaskResult) error {
@@ -602,12 +609,37 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 		return err
 	}
 	defer tx.Rollback(ctx)
+	// 回执不依赖实例/任务外键；删除已完成并清表后，同一结果重发仍能安全确认。
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, taskID); err != nil {
+		return err
+	}
+	claimHash, resultHash := taskResultHashes(result)
+	var previousHash string
+	err = tx.QueryRow(ctx, `SELECT result_hash FROM task_completion_receipts WHERE task_id=$1::uuid AND host_id=$2::uuid AND claim_token_hash=$3`, taskID, hostID, claimHash).Scan(&previousHash)
+	if err == nil {
+		if previousHash != resultHash {
+			return ErrTaskClaimConflict
+		}
+		return tx.Commit(ctx)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
 	var resourceID, taskType string
 	var attempt, maxAttempts int
-	err = tx.QueryRow(ctx, `SELECT resource_id::text,task_type,attempt,max_attempts FROM tasks WHERE id=$1::uuid AND host_id=$2::uuid AND status='RUNNING' FOR UPDATE`, taskID, hostID).Scan(&resourceID, &taskType, &attempt, &maxAttempts)
+	var claimMatches bool
+	err = tx.QueryRow(ctx, `SELECT resource_id::text,task_type,attempt,max_attempts,(status='RUNNING' AND coalesce(claim_token,'')=$3 AND lease_until>now()) FROM tasks WHERE id=$1::uuid AND host_id=$2::uuid FOR UPDATE`, taskID, hostID, result.ClaimToken).Scan(&resourceID, &taskType, &attempt, &maxAttempts, &claimMatches)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrTaskClaimConflict
+	}
 	if err != nil {
 		return err
 	}
+	if !claimMatches {
+		return ErrTaskClaimConflict
+	}
+	// 领取凭证仅用于当前请求鉴权，结果和任务历史不得持久化该明文凭证。
+	result.ClaimToken = ""
 	data, _ := json.Marshal(result)
 	if result.Success {
 		_, err = tx.Exec(ctx, `UPDATE tasks SET status='SUCCEEDED',result=$1,error_message=NULL,completed_at=now(),updated_at=now() WHERE id=$2::uuid`, data, taskID)
@@ -620,7 +652,10 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 	} else if taskType == "CREATE_INSTANCE" && result.ErrorCode == "IP_ADDRESS_IN_USE" {
 		err = s.retryCreateWithNextIPAddress(ctx, tx, taskID, resourceID, result)
 	} else {
-		_, err = tx.Exec(ctx, `UPDATE tasks SET status=CASE WHEN attempt>=max_attempts THEN 'FAILED' ELSE 'PENDING' END,error_message=$1,available_at=now()+interval '15 seconds',completed_at=CASE WHEN attempt>=max_attempts THEN now() ELSE NULL END,updated_at=now() WHERE id=$2::uuid`, result.Error, taskID)
+		if result.ErrorCode == "EXECUTION_UNCERTAIN" {
+			attempt = maxAttempts
+		}
+		_, err = tx.Exec(ctx, `UPDATE tasks SET status=CASE WHEN $3 OR attempt>=max_attempts THEN 'FAILED' ELSE 'PENDING' END,error_message=$1,available_at=now()+interval '15 seconds',completed_at=CASE WHEN $3 OR attempt>=max_attempts THEN now() ELSE NULL END,updated_at=now() WHERE id=$2::uuid`, result.Error, taskID, result.ErrorCode == "EXECUTION_UNCERTAIN")
 		if err == nil && attempt >= maxAttempts {
 			if _, err = tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,updated_at=now() WHERE id=$2::uuid`, terminalFailureStatus(taskType), resourceID); err != nil {
 				return err
@@ -633,6 +668,9 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 		}
 	}
 	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO task_completion_receipts(task_id,host_id,claim_token_hash,result_hash) VALUES($1::uuid,$2::uuid,$3,$4)`, taskID, hostID, claimHash, resultHash); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -704,7 +742,7 @@ func (s *Service) applySuccessfulTask(ctx context.Context, tx pgx.Tx, taskType, 
 	case "DELETE_INSTANCE":
 		var hostID, applicationID string
 		var cpu, memoryMB, diskGB int
-		if err := tx.QueryRow(ctx, `SELECT i.host_id::text,i.application_id::text,f.cpu,f.memory_mb,f.disk_gb FROM instances i JOIN applications a ON a.id=i.application_id JOIN flavors f ON f.id=a.flavor_id WHERE i.id=$1::uuid FOR UPDATE OF i`, resourceID).Scan(&hostID, &applicationID, &cpu, &memoryMB, &diskGB); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT host_id::text,application_id::text,allocated_cpu,allocated_memory_mb,allocated_disk_gb FROM instances WHERE id=$1::uuid FOR UPDATE`, resourceID).Scan(&hostID, &applicationID, &cpu, &memoryMB, &diskGB); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE ip_addresses SET status='FREE',instance_id=NULL,reserved_at=NULL,allocated_at=NULL,updated_at=now() WHERE instance_id=$1::uuid`, resourceID); err != nil {
@@ -753,35 +791,40 @@ func (s *Service) ReconcileInstanceLifecycle(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, `SELECT id::text,host_id::text,name,lifecycle_status FROM instances i WHERE ((i.lifecycle_status='RUNNING' AND i.expires_at<=now()) OR (i.lifecycle_status='RETAINED' AND i.retention_until<=now())) AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.resource_id=i.id AND t.status='FAILED' AND t.updated_at>=i.updated_at AND ((i.lifecycle_status='RUNNING' AND t.task_type='STOP_INSTANCE') OR (i.lifecycle_status='RETAINED' AND t.task_type='DELETE_INSTANCE'))) ORDER BY coalesce(i.retention_until,i.expires_at) FOR UPDATE OF i SKIP LOCKED LIMIT 50`)
+	rows, err := tx.Query(ctx, `SELECT id::text,host_id::text,name,lifecycle_status,restore_count,coalesce(retention_until,expires_at+interval '7 days') FROM instances i WHERE ((i.lifecycle_status IN ('RUNNING','STOPPED') AND i.expires_at<=now()) OR (i.lifecycle_status='RETAINED' AND i.retention_until<=now())) AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.resource_id=i.id AND (t.status IN ('PENDING','RUNNING') OR (t.status='FAILED' AND t.updated_at>=i.updated_at AND t.task_type IN ('STOP_INSTANCE','DELETE_INSTANCE')))) ORDER BY coalesce(i.retention_until,i.expires_at) FOR UPDATE OF i SKIP LOCKED LIMIT 50`)
 	if err != nil {
 		return err
 	}
-	type candidate struct{ id, hostID, name, status string }
+	type candidate struct {
+		id, hostID, name, status string
+		restoreCount             int
+		retentionUntil           time.Time
+	}
 	var candidates []candidate
 	for rows.Next() {
 		var item candidate
-		if err := rows.Scan(&item.id, &item.hostID, &item.name, &item.status); err != nil {
+		if err := rows.Scan(&item.id, &item.hostID, &item.name, &item.status, &item.restoreCount, &item.retentionUntil); err != nil {
 			rows.Close()
 			return err
 		}
 		candidates = append(candidates, item)
 	}
+	err = rows.Err()
 	rows.Close()
+	if err != nil {
+		return err
+	}
 	for _, item := range candidates {
-		taskType, nextStatus, reason := "STOP_INSTANCE", "STOPPING", "lease-expired"
+		reason := "lease-expired"
 		if item.status == "RETAINED" {
-			taskType, nextStatus, reason = "DELETE_INSTANCE", "DELETING", "retention-expired"
+			reason = "retention-expired"
 		}
-		if err := insertInstanceTask(ctx, tx, taskType, item.id, item.hostID, item.name, reason); err != nil {
+		result, err := s.releaseInstanceTx(ctx, tx, item.id, item.hostID, item.name, item.status, item.restoreCount, item.retentionUntil, reason)
+		if err != nil {
 			return err
 		}
-		if taskType == "STOP_INSTANCE" {
-			_, err = tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,retention_until=coalesce(retention_until,now()+interval '7 days'),updated_at=now() WHERE id=$2::uuid`, nextStatus, item.id)
-		} else {
-			_, err = tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,updated_at=now() WHERE id=$2::uuid`, nextStatus, item.id)
-		}
-		if err != nil {
+		detail, _ := json.Marshal(map[string]any{"reason": reason, "retention_days": result["retention_days"], "restore_count": item.restoreCount})
+		if _, err = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES('system','instance.expire','instance',$1,$2)`, item.id, detail); err != nil {
 			return err
 		}
 	}
@@ -801,6 +844,9 @@ func StartReconciler(ctx context.Context, service *Service) {
 			return
 		case <-ticker.C:
 			service.MarkOfflineHosts(ctx)
+			if err := service.RecoverTaskLeases(ctx); err != nil {
+				fmt.Printf("recover task leases: %v\n", err)
+			}
 			if err := service.ExpirePendingApprovals(ctx); err != nil {
 				fmt.Printf("expire pending approvals: %v\n", err)
 			}
