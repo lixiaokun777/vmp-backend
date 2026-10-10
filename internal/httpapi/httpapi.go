@@ -207,12 +207,12 @@ func (a *API) instanceDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	instance, _ = json.Marshal(fields)
-	tasks, err := queryRawList(r, a.Service.DB, `SELECT jsonb_build_object('id',id,'task_type',task_type,'status',status,'attempt',attempt,'max_attempts',max_attempts,'error_message',error_message,'created_at',created_at,'completed_at',completed_at) FROM tasks WHERE resource_id=$1::uuid OR (task_type='PROBE_IP_ADDRESS' AND payload->>'retry_instance_id'=$1) ORDER BY created_at DESC`, r.PathValue("id"))
+	tasks, err := queryRawList(r, a.Service.DB, `SELECT jsonb_build_object('id',id,'task_type',task_type,'status',status,'attempt',attempt,'max_attempts',max_attempts,'error_message',error_message,'created_at',created_at,'completed_at',completed_at) FROM tasks WHERE resource_id=$1::uuid OR (task_type='PROBE_IP_ADDRESS' AND payload->>'retry_instance_id'=($1::uuid)::text) ORDER BY created_at DESC`, r.PathValue("id"))
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	audits, err := queryRawList(r, a.Service.DB, `SELECT jsonb_build_object('action',action,'actor',actor,'detail',detail,'created_at',created_at) FROM audit_logs WHERE resource_type='instance' AND resource_id=$1 ORDER BY created_at DESC`, r.PathValue("id"))
+	audits, err := queryRawList(r, a.Service.DB, `SELECT jsonb_build_object('action',action,'actor',actor,'detail',detail,'created_at',created_at) FROM audit_logs WHERE resource_type='instance' AND resource_id=($1::uuid)::text ORDER BY created_at DESC`, r.PathValue("id"))
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return

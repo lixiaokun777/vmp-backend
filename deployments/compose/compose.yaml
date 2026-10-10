@@ -21,7 +21,7 @@ services:
         max-file: "5"
 
   control-plane:
-    image: ${VMP_BACKEND_IMAGE:-lixiaokun/vmp-backend:0.5.4}
+    image: ${VMP_BACKEND_IMAGE:-lixiaokun/vmp-backend:0.5.5}
     restart: unless-stopped
     environment:
       LISTEN_ADDR: :8080
