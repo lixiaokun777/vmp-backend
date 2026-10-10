@@ -1,5 +1,18 @@
 # API 说明
 
+## IP 复核与恢复（0.5.4）
+
+以下隔离地址管理接口仅管理员可用，须完成首登改密并携带 `X-VMP-Request: 1`：
+
+- `POST /api/v1/ip-addresses/{id}/probe`，JSON `{release_if_free:false}` 仅复核，`true` 为本次可靠空闲后安全解除。只允许 `QUARANTINED` 且无 `instance_id`，不处理已分配 / 预留 / 保留期地址。返回 202 `{task_id,ip_address,probe_pending,already_pending,message}`，排队不是解除成功；重复请求沿用原任务，不升级其解除权限。
+- `POST /api/v1/networks/{id}/probe-quarantined`，JSON `{release_if_free:true,limit:32}`；limit 默认 32，上限 64，返回 202 `{queued,skipped,limit,max_limit,remaining,confirmed_in_use,task_ids,message}`。remaining 指未复核或异常待查数量，confirmed_in_use 是已确认占用且仍隔离的数量；当前已排队地址跳过，优先无探测记录再按最近探测时间公平推进，不提供不经探测强制清空。
+- `GET /api/v1/ip-addresses` 增加 `last_probe_status=UNKNOWN|PENDING|FREE|IN_USE|ERROR`、`last_probe_at`、`last_probe_message`、`last_probe_host_id`、`last_probe_host`、`probe_pending`。探测结果与地址的可分配状态不同：仅复核为 FREE 的地址仍可保持隔离。
+- `POST /api/v1/instances/{id}/actions` 的 `retry` 在无 FREE、存在隔离候选时返回 `{status:'ERROR',recovery_pending:true,task_id,message}`，异步复核成功后自动继续原 CREATE；实例详情和列表增加 `ip_recovery_pending` / `ip_recovery_message` / `ip_recovery_task_id`，任务历史关联该复核。异步复核不改租期、不重复扣预算，最多 64 候选一轮，异常停止；有空闲地址时仍走原预留流程。
+
+Agent 新增 `PROBE_IP_ADDRESS` 任务，固定 payload `ip_address` / `bridge`；结果 `success=true,ip_address,ip_probe_status=FREE|IN_USE,ip_probe_message`。占用是一次成功的探测结论，不是命令异常。工具不兼容、权限或超时返回 `IP_PROBE_FAILED`，没有占用结论。创建真正冲突须同时 `IP_ADDRESS_IN_USE` 与 `ip_probe_status=IN_USE`；旧 Agent 无证据冲突码不再自动隔离地址。回调核验领取凭据、地址 / 网络 / 宿主 / 身份代次及当前绑定，不接受过期或跨目标结果。
+
+停止域开机 / 保留期恢复前 Agent 探测原 IP；失败不启动域、不换 IP、不删除磁盘或释放绑定。恢复失败保留原保留期和次数，成功才消耗恢复机会。无外部 DHCP 自动集成；平台范围必须从 DHCP 动态池排除。升级和操作步骤见 [0.5.4 升级与 IP 隔离恢复](0.5.4升级与IP隔离恢复.md)。
+
 `0.5.2` 注册补修：`POST /agents/register` 可带合法裸 IP `management_ip`，须以该宿主独立凭据更新已有地址。续注册省略、空字符串或空白时保持原地址，不从请求来源推断；非法 IP/CIDR/zone 返回 422，不能以引导令牌修改已纳管宿主。前端 `0.5.1` API 保持兼容，无新增迁移。
 
 ## 服务器分页与资源就绪（0.5.1）

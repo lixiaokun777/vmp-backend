@@ -146,7 +146,8 @@ func (s *Service) restoreInstanceTx(ctx context.Context, tx pgx.Tx, actor string
 	var owner, hostID, name, lifecycleStatus string
 	var restoreCount int
 	var retentionUntil *time.Time
-	err := tx.QueryRow(ctx, `SELECT a.applicant,i.host_id::text,i.name,i.lifecycle_status,i.retention_until,i.restore_count FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &hostID, &name, &lifecycleStatus, &retentionUntil, &restoreCount)
+	var oldExpiry time.Time
+	err := tx.QueryRow(ctx, `SELECT a.applicant,i.host_id::text,i.name,i.lifecycle_status,i.retention_until,i.restore_count,i.expires_at FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &hostID, &name, &lifecycleStatus, &retentionUntil, &restoreCount, &oldExpiry)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +174,7 @@ func (s *Service) restoreInstanceTx(ctx context.Context, tx pgx.Tx, actor string
 		return nil, err
 	}
 	var expiresAt time.Time
-	if err := tx.QueryRow(ctx, `UPDATE instances SET expires_at=now()+make_interval(hours=>$1),retention_until=NULL,lifecycle_status='STARTING',restore_count=restore_count+1,updated_at=now() WHERE id=$2::uuid RETURNING expires_at`, hours, instanceID).Scan(&expiresAt); err != nil {
+	if err := tx.QueryRow(ctx, `UPDATE instances SET expires_at=now()+make_interval(hours=>$1),lifecycle_status='STARTING',restore_pending=true,restore_previous_expires_at=$3,updated_at=now() WHERE id=$2::uuid RETURNING expires_at`, hours, instanceID, oldExpiry).Scan(&expiresAt); err != nil {
 		return nil, err
 	}
 	detail, _ := json.Marshal(map[string]any{"hours": hours, "reason": reason, "expires_at": expiresAt, "original_ip_retained": true})

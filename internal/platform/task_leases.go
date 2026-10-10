@@ -44,7 +44,7 @@ func (s *Service) RecoverTaskLeases(ctx context.Context) error {
 	if err := LockResourceReadiness(ctx, tx); err != nil {
 		return err
 	}
-	rows, err := tx.Query(ctx, `SELECT id::text,resource_id::text,task_type,attempt,max_attempts FROM tasks WHERE status='RUNNING' AND lease_until<=now() ORDER BY lease_until FOR UPDATE SKIP LOCKED LIMIT 50`)
+	rows, err := tx.Query(ctx, `SELECT id::text,resource_id::text,task_type,attempt,max_attempts FROM tasks WHERE (status='RUNNING' AND lease_until<=now()) OR (task_type='PROBE_IP_ADDRESS' AND status='PENDING' AND created_at<=now()-interval '10 minutes') ORDER BY coalesce(lease_until,created_at) FOR UPDATE SKIP LOCKED LIMIT 50`)
 	if err != nil {
 		return err
 	}
@@ -68,9 +68,16 @@ func (s *Service) RecoverTaskLeases(ctx context.Context) error {
 	}
 	for _, task := range tasks {
 		message := "任务租约过期，已重新排队等待宿主机安全重试"
-		terminal := task.attempt >= task.maxAttempts || task.taskType == "REBOOT_INSTANCE"
+		terminal := task.attempt >= task.maxAttempts || task.taskType == "REBOOT_INSTANCE" || task.taskType == "PROBE_IP_ADDRESS"
 		if terminal {
 			message = "任务租约过期且结果不确定，请核查实例实际状态后再操作"
+			if task.taskType == "PROBE_IP_ADDRESS" {
+				if task.attempt == 0 {
+					message = "地址复核排队超过10分钟，尚未执行；请检查宿主后重新提交"
+				} else {
+					message = "地址探测执行租约已过期，未解除隔离；请重新复核"
+				}
+			}
 			if _, err = tx.Exec(ctx, `UPDATE tasks SET status='FAILED',error_message=$1,completed_at=now(),lease_until=NULL,updated_at=now() WHERE id=$2::uuid`, message, task.id); err != nil {
 				return err
 			}
@@ -80,7 +87,13 @@ func (s *Service) RecoverTaskLeases(ctx context.Context) error {
 				}
 				continue
 			}
-			if _, err = tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,updated_at=now() WHERE id=$2::uuid`, terminalFailureStatus(task.taskType), task.resourceID); err != nil {
+			if task.taskType == "PROBE_IP_ADDRESS" {
+				if err = s.failIPProbeLeaseTx(ctx, tx, task.id, task.resourceID, message); err != nil {
+					return err
+				}
+				continue
+			}
+			if err = s.applyTerminalTaskFailureTx(ctx, tx, task.taskType, task.resourceID, message); err != nil {
 				return err
 			}
 			if task.taskType == "CREATE_INSTANCE" || task.taskType == "START_INSTANCE" {

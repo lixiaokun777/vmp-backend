@@ -73,6 +73,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/networks/{id}/ip-ranges", a.addIPRange)
 	mux.HandleFunc("DELETE /api/v1/networks/{id}/ip-ranges", a.deleteIPRange)
 	mux.HandleFunc("GET /api/v1/ip-addresses", a.ipAddresses)
+	mux.HandleFunc("POST /api/v1/ip-addresses/{id}/probe", a.probeIPAddress)
+	mux.HandleFunc("POST /api/v1/networks/{id}/probe-quarantined", a.probeQuarantinedNetwork)
 	mux.HandleFunc("GET /api/v1/applications", a.applications)
 	mux.HandleFunc("POST /api/v1/applications", a.createApplication)
 	mux.HandleFunc("GET /api/v1/instances", a.instances)
@@ -186,7 +188,7 @@ func (a *API) instanceDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var extra json.RawMessage
-	err = a.Service.DB.QueryRow(r.Context(), `SELECT jsonb_build_object('delivery_status',i.delivery_status,'delivery_message',i.delivery_message,'observed_domain_status',i.observed_domain_status,'last_domain_seen_at',i.last_domain_seen_at,'network_id',i.network_id,'console_available',i.expires_at>now() AND i.lifecycle_status IN ('RUNNING','PROVISIONING','ERROR','STOPPED') AND EXISTS(SELECT 1 FROM discovered_instances d WHERE d.host_id=i.host_id AND d.platform_instance_id=i.id AND d.name=i.name AND d.ownership='MANAGED' AND (i.provider_ref IS NULL OR i.provider_ref=d.provider_uuid) AND d.last_seen_at>now()-interval '120 seconds' AND lower(replace(d.state,' ','_')) IN ('running','paused','blocked','pmsuspended'))) FROM instances i JOIN applications ap ON ap.id=i.application_id WHERE i.id=$1::uuid AND ($3 OR ap.applicant=$2)`, r.PathValue("id"), user.Username, user.Role == "ADMIN").Scan(&extra)
+	err = a.Service.DB.QueryRow(r.Context(), `SELECT jsonb_build_object('delivery_status',i.delivery_status,'delivery_message',i.delivery_message,'observed_domain_status',i.observed_domain_status,'last_domain_seen_at',i.last_domain_seen_at,'network_id',i.network_id,'ip_recovery_pending',i.ip_recovery_pending,'ip_recovery_message',i.ip_recovery_message,'ip_recovery_task_id',i.ip_recovery_task_id,'console_available',i.expires_at>now() AND i.lifecycle_status IN ('RUNNING','PROVISIONING','ERROR','STOPPED') AND EXISTS(SELECT 1 FROM discovered_instances d WHERE d.host_id=i.host_id AND d.platform_instance_id=i.id AND d.name=i.name AND d.ownership='MANAGED' AND (i.provider_ref IS NULL OR i.provider_ref=d.provider_uuid) AND d.last_seen_at>now()-interval '120 seconds' AND lower(replace(d.state,' ','_')) IN ('running','paused','blocked','pmsuspended'))) FROM instances i JOIN applications ap ON ap.id=i.application_id WHERE i.id=$1::uuid AND ($3 OR ap.applicant=$2)`, r.PathValue("id"), user.Username, user.Role == "ADMIN").Scan(&extra)
 	if err != nil {
 		writeError(w, 404, "实例已变化，请刷新")
 		return
@@ -205,7 +207,7 @@ func (a *API) instanceDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	instance, _ = json.Marshal(fields)
-	tasks, err := queryRawList(r, a.Service.DB, `SELECT jsonb_build_object('id',id,'task_type',task_type,'status',status,'attempt',attempt,'max_attempts',max_attempts,'error_message',error_message,'created_at',created_at,'completed_at',completed_at) FROM tasks WHERE resource_id=$1::uuid ORDER BY created_at DESC`, r.PathValue("id"))
+	tasks, err := queryRawList(r, a.Service.DB, `SELECT jsonb_build_object('id',id,'task_type',task_type,'status',status,'attempt',attempt,'max_attempts',max_attempts,'error_message',error_message,'created_at',created_at,'completed_at',completed_at) FROM tasks WHERE resource_id=$1::uuid OR (task_type='PROBE_IP_ADDRESS' AND payload->>'retry_instance_id'=$1) ORDER BY created_at DESC`, r.PathValue("id"))
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return

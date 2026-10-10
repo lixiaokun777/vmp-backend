@@ -107,6 +107,8 @@ type TaskResult struct {
 	ProviderStatus  string `json:"provider_status,omitempty"`
 	DeliveryStatus  string `json:"delivery_status,omitempty"`
 	DeliveryMessage string `json:"delivery_message,omitempty"`
+	IPProbeStatus   string `json:"ip_probe_status,omitempty"`
+	IPProbeMessage  string `json:"ip_probe_message,omitempty"`
 }
 
 func New(ctx context.Context, databaseURL string) (*Service, error) {
@@ -442,12 +444,16 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 	if !uuidPattern.MatchString(instanceID) {
 		return nil, errors.New("invalid instance id")
 	}
+	instanceID = strings.ToLower(instanceID)
 	action = strings.ToLower(strings.TrimSpace(action))
 	tx, err := s.DB.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	if err := LockResourceReadiness(ctx, tx); err != nil {
+		return nil, err
+	}
 	var owner, hostID, name, username, ipAddress, lifecycleStatus, deliveryStatus string
 	var restoreCount int
 	var expiresAt time.Time
@@ -506,7 +512,14 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 			return nil, errors.New("failed create task was not found")
 		}
 		if err := s.retryCreateTx(ctx, tx, instanceID, hostID, failedTaskID); err != nil {
-			return nil, err
+			if !errors.Is(err, ErrIPRecoveryQueued) {
+				return nil, err
+			}
+			response, err := s.ipRecoveryResponseTx(ctx, tx, instanceID)
+			if err != nil {
+				return nil, err
+			}
+			return response, tx.Commit(ctx)
 		}
 		_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.retry','instance',$2,'{}'::jsonb)`, actor, instanceID)
 		if err := tx.Commit(ctx); err != nil {
@@ -555,6 +568,9 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 		}
 		if activeTasks > 0 {
 			return nil, errors.New("instance still has an active task")
+		}
+		if err := s.cancelIPRecoveryTx(ctx, tx, instanceID); err != nil {
+			return nil, err
 		}
 		if err := insertInstanceTask(ctx, tx, "DELETE_INSTANCE", instanceID, hostID, name, "force-delete"); err != nil {
 			return nil, err
@@ -656,6 +672,9 @@ func (s *Service) PollTask(ctx context.Context, hostID string) (map[string]any, 
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	if err := LockResourceReadiness(ctx, tx); err != nil {
+		return nil, err
+	}
 	// 同一宿主的领取串行化，避免两个连接同时取得不同任务并发操作 libvirt。
 	var mode string
 	if err := tx.QueryRow(ctx, `SELECT agent_mode FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&mode); err != nil {
@@ -670,6 +689,46 @@ func (s *Service) PollTask(ctx context.Context, hostID string) (map[string]any, 
 	err = tx.QueryRow(ctx, `SELECT t.id::text,t.task_type,t.payload FROM tasks t WHERE t.host_id=$1::uuid AND t.status='PENDING' AND t.available_at<=now() AND NOT EXISTS(SELECT 1 FROM tasks running WHERE running.host_id=t.host_id AND running.status='RUNNING') ORDER BY t.created_at FOR UPDATE OF t SKIP LOCKED LIMIT 1`, hostID).Scan(&id, &typ, &payload)
 	if err != nil {
 		return nil, err
+	}
+	if typ == "PROBE_IP_ADDRESS" {
+		var fresh bool
+		var resource string
+		if err = tx.QueryRow(ctx, `SELECT created_at>now()-interval '10 minutes',resource_id::text FROM tasks WHERE id=$1::uuid`, id).Scan(&fresh, &resource); err != nil {
+			return nil, err
+		}
+		if !fresh {
+			message := "地址复核排队超过10分钟，未执行，请检查宿主后重新提交"
+			if _, err = tx.Exec(ctx, `UPDATE tasks SET status='FAILED',error_message=$2,completed_at=now(),updated_at=now() WHERE id=$1::uuid`, id, message); err != nil {
+				return nil, err
+			}
+			if err = s.failIPProbeLeaseTx(ctx, tx, id, resource, message); err != nil {
+				return nil, err
+			}
+			if err = tx.Commit(ctx); err != nil {
+				return nil, err
+			}
+			return nil, pgx.ErrNoRows
+		}
+	}
+	if typ == "CREATE_INSTANCE" || typ == "START_INSTANCE" {
+		var valid bool
+		var resource string
+		if err = tx.QueryRow(ctx, `SELECT t.resource_id::text,EXISTS(SELECT 1 FROM instances i JOIN applications ap ON ap.id=i.application_id JOIN users u ON lower(u.username)=lower(ap.applicant) WHERE i.id=t.resource_id AND i.host_id=t.host_id AND i.expires_at>now() AND i.lifecycle_status=CASE WHEN t.task_type='CREATE_INSTANCE' THEN 'PROVISIONING' ELSE 'STARTING' END AND u.enabled AND (u.source<>'LDAP' OR u.ldap_directory_present)) FROM tasks t WHERE id=$1::uuid`, id).Scan(&resource, &valid); err != nil {
+			return nil, err
+		}
+		if !valid {
+			message := "原申请已过期、已被撤销或账号失效，未执行创建/启动"
+			if _, err = tx.Exec(ctx, `UPDATE tasks SET status='FAILED',error_message=$2,completed_at=now(),updated_at=now() WHERE id=$1::uuid`, id, message); err != nil {
+				return nil, err
+			}
+			if err = s.applyTerminalTaskFailureTx(ctx, tx, typ, resource, message); err != nil {
+				return nil, err
+			}
+			if err = tx.Commit(ctx); err != nil {
+				return nil, err
+			}
+			return nil, pgx.ErrNoRows
+		}
 	}
 	err = tx.QueryRow(ctx, `UPDATE tasks SET status='RUNNING',attempt=attempt+1,claimed_at=now(),claim_token=encode(gen_random_bytes(32),'hex'),lease_until=now()+interval '60 seconds',updated_at=now() WHERE id=$1::uuid RETURNING claim_token,lease_until`, id).Scan(&claimToken, &leaseUntil)
 	if err != nil {
@@ -729,7 +788,20 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 	// 领取凭证仅用于当前请求鉴权，结果和任务历史不得持久化该明文凭证。
 	result.ClaimToken = ""
 	data, _ := json.Marshal(result)
-	if result.Success {
+	confirmedConflict := false
+	createNoLongerValid := false
+	if taskType == "CREATE_INSTANCE" && !result.Success {
+		var valid, noDomain bool
+		var expectedIP string
+		if err = tx.QueryRow(ctx, `SELECT i.lifecycle_status='PROVISIONING' AND i.expires_at>now() AND EXISTS(SELECT 1 FROM applications ap JOIN users u ON lower(u.username)=lower(ap.applicant) WHERE ap.id=i.application_id AND u.enabled AND (u.source<>'LDAP' OR u.ldap_directory_present)),i.provider_ref IS NULL AND NOT EXISTS(SELECT 1 FROM discovered_instances d WHERE d.platform_instance_id=i.id AND d.ownership='MANAGED'),coalesce(host(i.ip_address),'') FROM instances i WHERE id=$1::uuid FOR UPDATE`, resourceID).Scan(&valid, &noDomain, &expectedIP); err != nil {
+			return err
+		}
+		createNoLongerValid = !valid
+		confirmedConflict = valid && noDomain && result.ProviderRef == "" && result.ErrorCode == "IP_ADDRESS_IN_USE" && result.IPProbeStatus == "IN_USE" && result.IPAddress != "" && result.IPAddress == expectedIP
+	}
+	if taskType == "PROBE_IP_ADDRESS" {
+		err = s.applyIPProbeResultTx(ctx, tx, taskID, resourceID, hostID, result)
+	} else if result.Success {
 		_, err = tx.Exec(ctx, `UPDATE tasks SET status='SUCCEEDED',result=$1,error_message=NULL,completed_at=now(),updated_at=now() WHERE id=$2::uuid`, data, taskID)
 		if err == nil && taskType == "SYNC_IMAGE" {
 			err = s.applyImageSyncResultTx(ctx, tx, taskID, hostID, result)
@@ -739,17 +811,21 @@ func (s *Service) CompleteTask(ctx context.Context, hostID, taskID string, resul
 		if err == nil && (taskType == "CREATE_INSTANCE" || taskType == "START_INSTANCE") {
 			_, err = tx.Exec(ctx, `UPDATE approval_requests SET status='APPROVED',result=result-'error',updated_at=now() WHERE instance_id=$1::uuid AND status='APPROVED_FAILED' AND ((request_type='CREATE' AND $2='CREATE_INSTANCE') OR (request_type='RESTORE' AND $2='START_INSTANCE'))`, resourceID, taskType)
 		}
-	} else if taskType == "CREATE_INSTANCE" && result.ErrorCode == "IP_ADDRESS_IN_USE" {
+	} else if confirmedConflict {
 		err = s.retryCreateWithNextIPAddress(ctx, tx, taskID, resourceID, result)
 	} else {
-		if result.ErrorCode == "EXECUTION_UNCERTAIN" {
+		terminalProbeFailure := taskType == "START_INSTANCE" && (result.ErrorCode == "IP_ADDRESS_IN_USE" || result.ErrorCode == "IP_PROBE_FAILED")
+		if createNoLongerValid {
+			result.Error = "原创建已过期、已被撤销或账号失效，停止自动重试"
+		}
+		if result.ErrorCode == "EXECUTION_UNCERTAIN" || terminalProbeFailure || createNoLongerValid {
 			attempt = maxAttempts
 		}
-		_, err = tx.Exec(ctx, `UPDATE tasks SET status=CASE WHEN $3 OR attempt>=max_attempts THEN 'FAILED' ELSE 'PENDING' END,error_message=$1,available_at=now()+interval '15 seconds',completed_at=CASE WHEN $3 OR attempt>=max_attempts THEN now() ELSE NULL END,updated_at=now() WHERE id=$2::uuid`, result.Error, taskID, result.ErrorCode == "EXECUTION_UNCERTAIN")
+		_, err = tx.Exec(ctx, `UPDATE tasks SET status=CASE WHEN $3 OR attempt>=max_attempts THEN 'FAILED' ELSE 'PENDING' END,result=$4,error_message=$1,available_at=now()+interval '15 seconds',completed_at=CASE WHEN $3 OR attempt>=max_attempts THEN now() ELSE NULL END,updated_at=now() WHERE id=$2::uuid`, result.Error, taskID, result.ErrorCode == "EXECUTION_UNCERTAIN" || terminalProbeFailure || createNoLongerValid, data)
 		if err == nil && taskType == "SYNC_IMAGE" {
 			err = s.applyImageSyncResultTx(ctx, tx, taskID, hostID, result)
 		} else if err == nil && attempt >= maxAttempts {
-			if _, err = tx.Exec(ctx, `UPDATE instances SET lifecycle_status=$1,updated_at=now() WHERE id=$2::uuid`, terminalFailureStatus(taskType), resourceID); err != nil {
+			if err = s.applyTerminalTaskFailureTx(ctx, tx, taskType, resourceID, result.Error); err != nil {
 				return err
 			}
 			if taskType == "CREATE_INSTANCE" || taskType == "START_INSTANCE" {
@@ -778,7 +854,10 @@ func (s *Service) retryCreateWithNextIPAddress(ctx context.Context, tx pgx.Tx, t
 	if err != nil {
 		return fmt.Errorf("locate occupied instance IP: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `UPDATE ip_addresses SET status='QUARANTINED',instance_id=NULL,reserved_at=NULL,allocated_at=NULL,updated_at=now() WHERE id=$1::uuid`, occupiedID); err != nil {
+	if result.IPAddress != "" && result.IPAddress != occupiedAddress {
+		return ErrTaskClaimConflict
+	}
+	if _, err := tx.Exec(ctx, `UPDATE ip_addresses SET status='QUARANTINED',instance_id=NULL,reserved_at=NULL,allocated_at=NULL,last_probe_status='IN_USE',last_probe_at=now(),last_probe_message=$2,last_probe_host_id=(SELECT host_id FROM tasks WHERE id=$3::uuid),updated_at=now() WHERE id=$1::uuid`, occupiedID, probeMessage(result.IPProbeMessage), taskID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE instances SET ip_address=NULL,updated_at=now() WHERE id=$1::uuid`, instanceID); err != nil {
@@ -786,20 +865,31 @@ func (s *Service) retryCreateWithNextIPAddress(ctx context.Context, tx pgx.Tx, t
 	}
 
 	var nextID, nextAddress string
-	err = tx.QueryRow(ctx, `SELECT id::text,host(address) FROM ip_addresses WHERE network_id=$1::uuid AND status='FREE' ORDER BY address FOR UPDATE SKIP LOCKED LIMIT 1`, networkID).Scan(&nextID, &nextAddress)
+	var conflicts int
+	if err = tx.QueryRow(ctx, `UPDATE tasks SET ip_conflict_count=ip_conflict_count+1 WHERE id=$1::uuid RETURNING ip_conflict_count`, taskID).Scan(&conflicts); err != nil {
+		return err
+	}
+	if conflicts >= maxIPProbeBatch {
+		err = pgx.ErrNoRows
+	} else {
+		err = tx.QueryRow(ctx, `SELECT id::text,host(address) FROM ip_addresses WHERE network_id=$1::uuid AND status='FREE' ORDER BY address FOR UPDATE SKIP LOCKED LIMIT 1`, networkID).Scan(&nextID, &nextAddress)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		message := fmt.Sprintf("IP %s 已被占用，地址池中没有其他可用 IP", occupiedAddress)
+		if conflicts >= maxIPProbeBatch {
+			message = "已达到单次64个真实冲突候选上限，停止自动换IP；请管理员复核后重试"
+		}
 		data, _ := json.Marshal(result)
 		if _, updateErr := tx.Exec(ctx, `UPDATE tasks SET status='FAILED',result=$1,error_message=$2,completed_at=now(),updated_at=now() WHERE id=$3::uuid`, data, message, taskID); updateErr != nil {
 			return updateErr
 		}
-		if _, updateErr := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='ERROR',updated_at=now() WHERE id=$1::uuid`, instanceID); updateErr != nil {
+		if _, updateErr := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='ERROR',delivery_status='FAILED',delivery_message=$2,updated_at=now() WHERE id=$1::uuid`, instanceID, message); updateErr != nil {
 			return updateErr
 		}
 		if _, updateErr := tx.Exec(ctx, `UPDATE approval_requests SET status='APPROVED_FAILED',result=coalesce(result,'{}'::jsonb)||jsonb_build_object('error',$1::text),updated_at=now() WHERE instance_id=$2::uuid AND status='APPROVED' AND request_type='CREATE'`, message, instanceID); updateErr != nil {
 			return updateErr
 		}
-		_, updateErr := tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,outcome,detail) VALUES ('system','ip.address.quarantine','ip_address',$1,'SUCCESS',jsonb_build_object('address',$2::text,'reason','icmp_reply','replacement',NULL))`, occupiedID, occupiedAddress)
+		_, updateErr := tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,outcome,detail) VALUES ('system','ip.address.quarantine','ip_address',$1,'SUCCESS',jsonb_build_object('address',$2::text,'reason',$3::text,'probe_status','IN_USE','replacement',NULL))`, occupiedID, occupiedAddress, probeMessage(result.IPProbeMessage))
 		return updateErr
 	}
 	if err != nil {
@@ -816,7 +906,7 @@ func (s *Service) retryCreateWithNextIPAddress(ctx context.Context, tx pgx.Tx, t
 	if _, err := tx.Exec(ctx, `UPDATE tasks SET status='PENDING',attempt=0,result=$1,error_message=$2,payload=jsonb_set(payload,'{ip_address}',to_jsonb($3::text),true),available_at=now(),claimed_at=NULL,completed_at=NULL,updated_at=now() WHERE id=$4::uuid`, data, message, nextAddress, taskID); err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,outcome,detail) VALUES ('system','ip.address.quarantine','ip_address',$1,'SUCCESS',jsonb_build_object('address',$2::text,'reason','icmp_reply','replacement',$3::text,'instance_id',$4::text))`, occupiedID, occupiedAddress, nextAddress, instanceID)
+	_, err = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,outcome,detail) VALUES ('system','ip.address.quarantine','ip_address',$1,'SUCCESS',jsonb_build_object('address',$2::text,'reason',$5::text,'probe_status','IN_USE','replacement',$3::text,'instance_id',$4::text))`, occupiedID, occupiedAddress, nextAddress, instanceID, probeMessage(result.IPProbeMessage))
 	return err
 }
 
@@ -833,7 +923,11 @@ func (s *Service) applySuccessfulTask(ctx context.Context, tx pgx.Tx, taskType, 
 		_, err := tx.Exec(ctx, `UPDATE ip_addresses SET status='ALLOCATED',allocated_at=now(),updated_at=now() WHERE instance_id=$1::uuid`, resourceID)
 		return err
 	case "START_INSTANCE", "REBOOT_INSTANCE":
-		_, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='RUNNING',provider_status='RUNNING',updated_at=now() WHERE id=$1::uuid`, resourceID)
+		delivery := normalizeDeliveryStatus(result.DeliveryStatus)
+		if delivery == "UNKNOWN" {
+			delivery = ""
+		}
+		_, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='RUNNING',provider_status='RUNNING',retention_until=CASE WHEN restore_pending THEN NULL ELSE retention_until END,restore_count=restore_count+CASE WHEN restore_pending THEN 1 ELSE 0 END,restore_pending=false,restore_previous_expires_at=NULL,delivery_status=CASE WHEN $2<>'' THEN $2 ELSE delivery_status END,delivery_message=$3,updated_at=now() WHERE id=$1::uuid`, resourceID, delivery, probeMessage(result.DeliveryMessage))
 		return err
 	case "STOP_INSTANCE":
 		_, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status=CASE WHEN retention_until IS NOT NULL AND expires_at<=now() THEN 'RETAINED' ELSE 'STOPPED' END,provider_status='STOPPED',updated_at=now() WHERE id=$1::uuid`, resourceID)

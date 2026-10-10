@@ -78,7 +78,7 @@ func TestFailedCreateRebuildsIPReservationDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CompleteTask(ctx, host, task["id"].(string), TaskResult{ClaimToken: task["claim_token"].(string), ErrorCode: "IP_ADDRESS_IN_USE", Error: "隔离测试占用"}); err != nil {
+	if err := s.CompleteTask(ctx, host, task["id"].(string), TaskResult{ClaimToken: task["claim_token"].(string), ErrorCode: "IP_ADDRESS_IN_USE", IPAddress: task["payload"].(map[string]any)["ip_address"].(string), IPProbeStatus: "IN_USE", IPProbeMessage: "ARP确认占用", Error: "隔离测试占用"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.PerformInstanceAction(ctx, "isolated-user", false, id, "retry"); err == nil {
