@@ -19,6 +19,20 @@ jobs:
       - name: 检出源码
         uses: actions/checkout@v4
 
+      - name: 确认新固定标签未被占用
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          REGISTRY_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          url="https://hub.docker.com/v2/repositories/${REGISTRY_USER}/vmp-backend/tags/${version}/"
+          status="$(curl --silent --show-error --retry 3 --max-time 30 --output "${RUNNER_TEMP}/vmp-tag-check.json" --write-out '%{http_code}' "$url")"
+          case "$status" in
+            404) echo "目标固定版本不存在，允许发布。" ;;
+            200) echo "目标固定版本已经存在，拒绝覆盖旧镜像。" >&2; exit 1 ;;
+            *) echo "无法确认固定版本是否存在，HTTP $status；停止发布。" >&2; exit 1 ;;
+          esac
+
       - name: 启用多架构模拟
         uses: docker/setup-qemu-action@v3
 
@@ -51,3 +65,12 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: 验证双架构发布清单
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          REGISTRY_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          image="${REGISTRY_USER}/vmp-backend:${GITHUB_REF_NAME#v}"
+          docker buildx imagetools inspect "$image"
+          docker buildx imagetools inspect --raw "$image" | jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] as $platforms | ($platforms | index("amd64") != null) and ($platforms | index("arm64") != null)'
