@@ -1,5 +1,13 @@
 # API 说明
 
+## 个人概览、监控与交付诊断（未发布）
+
+- `GET /api/v1/me/overview`：当前登录用户的个人概览，返回 `active_instances`、`quota_instances`、已占 CPU/内存/磁盘、最近到期、24 小时内到期数及平台配置的用户额度。服务端固定按会话用户过滤，普通用户不能传用户名查看他人数据。
+- `GET /api/v1/applications?scope=mine&page=1&page_size=20`：申请分页。普通用户始终只返回自己的申请；每条记录可包含关联实例状态、最新 `CREATE_INSTANCE` 任务状态、`error_code` 和安全错误信息。错误码用于页面自助诊断，不返回任务负载、领取凭据或敏感执行上下文。
+- `GET /api/v1/instances/{id}/metrics?hours=24`：实例所有者或管理员读取 1–168 小时 CPU/内存分钟点。CPU 为该虚拟机已分配 vCPU 总算力百分比；内存优先由 balloon `current-unused` 计算，缺少 guest 统计时使用宿主 RSS 并通过 `memory_metric_source` 标明。没有指标时返回空数组，不把“无数据”当成 0 使用率。
+
+Agent 心跳域对象增加可选 `cpu_usage_percent`、`memory_usage_mb`、`memory_metric_source` 和 `metrics_collected_at`。后端只在完整新清单中接受平台托管、身份有效的实例指标，每分钟幂等落点，保留 7 天；旧 Agent 心跳保持兼容。数据库由 `022_instance_metrics.sql` 自动迁移，无手工导入步骤和新增环境变量。
+
 ## 实例详情修补（0.5.5）
 
 `GET /api/v1/instances/{id}` 修复 UUID 与 JSON 文本任务关联比较导致的 PostgreSQL 42883 / HTTP 500，返回结构不变。合法大写 UUID 的任务和审计关联按规范化文本比较。管理员 / 当前所有者可读，其他用户仍得到 404；无任务 / 审计时返回 `[]`，普通用户仍不获得镜像本地路径，任务仍不返回负载或领取凭据。无新增数据库迁移、配置或 Agent 字段，前端 0.5.3 / Agent 0.5.4 保持不变。

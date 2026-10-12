@@ -51,6 +51,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/notifications/test", a.testNotification)
 	mux.HandleFunc("GET /api/v1/notifications/events", a.notificationEvents)
 	mux.HandleFunc("GET /api/v1/summary", a.summary)
+	mux.HandleFunc("GET /api/v1/me/overview", a.myOverview)
 	mux.HandleFunc("GET /api/v1/hosts", a.hosts)
 	mux.HandleFunc("PATCH /api/v1/hosts/{id}/status", a.hostStatus)
 	mux.HandleFunc("PATCH /api/v1/hosts/{id}/quota", a.hostQuota)
@@ -79,6 +80,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/applications", a.createApplication)
 	mux.HandleFunc("GET /api/v1/instances", a.instances)
 	mux.HandleFunc("GET /api/v1/instances/{id}", a.instanceDetail)
+	mux.HandleFunc("GET /api/v1/instances/{id}/metrics", a.instanceMetrics)
 	mux.HandleFunc("POST /api/v1/instances/{id}/actions", a.instanceAction)
 	mux.HandleFunc("POST /api/v1/instances/{id}/renew", a.renewInstance)
 	mux.HandleFunc("POST /api/v1/instances/{id}/restore", a.restoreInstance)
@@ -173,7 +175,7 @@ func (a *API) images(w http.ResponseWriter, r *http.Request) {
 	a.queryList(w, r, `SELECT jsonb_build_object('id',images.id,'name',name,'file_name',file_name,'source_type',source_type,'source_location',source_location,'checksum',checksum,'sync_status',sync_status,'os_family',os_family,'version',version,'enabled',enabled,'desired_enabled',desired_enabled,'generation',generation,'host_readiness',coalesce((SELECT jsonb_agg(jsonb_build_object('host_id',hi.host_id,'host_name',h.name,'status',CASE WHEN hi.generation<>images.generation OR hi.reported_at<now()-interval '120 seconds' THEN 'STALE' ELSE hi.status END,'error',hi.error,'verified_at',hi.verified_at,'generation',hi.generation) ORDER BY h.name) FROM host_images hi JOIN hosts h ON h.id=hi.host_id WHERE hi.image_id=images.id),'[]'::jsonb)) FROM images`+filter+` ORDER BY name,id`)
 }
 func (a *API) applications(w http.ResponseWriter, r *http.Request) {
-	a.queryList(w, r, `SELECT jsonb_build_object('id',a.id,'request_no',a.request_no,'applicant',a.applicant,'instance_name',a.instance_name,'purpose',a.purpose,'flavor',f.name,'image',i.name,'lease_hours',a.lease_hours,'status',a.status,'created_at',a.created_at) FROM applications a JOIN flavors f ON f.id=a.flavor_id JOIN images i ON i.id=a.image_id ORDER BY a.created_at DESC`)
+	a.applicationsPage(w, r)
 }
 func (a *API) instances(w http.ResponseWriter, r *http.Request) {
 	a.instancesPage(w, r)
@@ -207,7 +209,7 @@ func (a *API) instanceDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	instance, _ = json.Marshal(fields)
-	tasks, err := queryRawList(r, a.Service.DB, `SELECT jsonb_build_object('id',id,'task_type',task_type,'status',status,'attempt',attempt,'max_attempts',max_attempts,'error_message',error_message,'created_at',created_at,'completed_at',completed_at) FROM tasks WHERE resource_id=$1::uuid OR (task_type='PROBE_IP_ADDRESS' AND payload->>'retry_instance_id'=($1::uuid)::text) ORDER BY created_at DESC`, r.PathValue("id"))
+	tasks, err := queryRawList(r, a.Service.DB, `SELECT jsonb_build_object('id',id,'task_type',task_type,'status',status,'attempt',attempt,'max_attempts',max_attempts,'error_code',coalesce(result->>'error_code',''),'error_message',error_message,'created_at',created_at,'completed_at',completed_at) FROM tasks WHERE resource_id=$1::uuid OR (task_type='PROBE_IP_ADDRESS' AND payload->>'retry_instance_id'=($1::uuid)::text) ORDER BY created_at DESC`, r.PathValue("id"))
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return

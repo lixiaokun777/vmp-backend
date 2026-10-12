@@ -6,6 +6,20 @@ import (
 	"strings"
 )
 
+func (a *API) applicationsPage(w http.ResponseWriter, r *http.Request) {
+	user, _ := userFromRequest(r)
+	f := listConditions{}
+	if user.Role != "ADMIN" || r.URL.Query().Get("scope") == "mine" {
+		f.add("lower(a.applicant)=lower($%d)", user.Username)
+	}
+	if keyword := strings.TrimSpace(r.URL.Query().Get("keyword")); keyword != "" {
+		f.add("(a.request_no ILIKE '%%'||$%[1]d||'%%' OR a.instance_name ILIKE '%%'||$%[1]d||'%%' OR a.purpose ILIKE '%%'||$%[1]d||'%%')", keyword)
+	}
+	item := `jsonb_build_object('id',a.id,'request_no',a.request_no,'applicant',a.applicant,'instance_name',a.instance_name,'purpose',a.purpose,'flavor',f.name,'image',im.name,'lease_hours',a.lease_hours,'status',a.status,'created_at',a.created_at,'instance_id',ins.id,'lifecycle_status',ins.lifecycle_status,'delivery_status',ins.delivery_status,'delivery_message',ins.delivery_message,'task_status',task.status,'error_code',coalesce(task.result->>'error_code',''),'error_message',task.error_message,'task_updated_at',task.updated_at)`
+	from := `FROM applications a JOIN flavors f ON f.id=a.flavor_id JOIN images im ON im.id=a.image_id LEFT JOIN instances ins ON ins.application_id=a.id LEFT JOIN LATERAL (SELECT t.status,t.result,t.error_message,t.updated_at FROM tasks t WHERE t.resource_id=ins.id AND t.task_type='CREATE_INSTANCE' ORDER BY t.created_at DESC LIMIT 1) task ON true`
+	a.queryPage(w, r, item, from, "ORDER BY a.created_at DESC,a.id DESC", f)
+}
+
 func (a *API) usersPage(w http.ResponseWriter, r *http.Request) {
 	f := listConditions{}
 	for _, entry := range []struct {

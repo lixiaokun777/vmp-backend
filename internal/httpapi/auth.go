@@ -215,7 +215,7 @@ func ordinaryUserRouteAllowed(r *http.Request) bool {
 	if strings.HasPrefix(path, "/api/v1/auth/") {
 		return true
 	}
-	if r.Method == http.MethodGet && (path == "/api/v1/flavors" || path == "/api/v1/images" || path == "/api/v1/networks" || path == "/api/v1/instances" || path == "/api/v1/approvals") {
+	if r.Method == http.MethodGet && (path == "/api/v1/me/overview" || path == "/api/v1/flavors" || path == "/api/v1/images" || path == "/api/v1/networks" || path == "/api/v1/instances" || path == "/api/v1/approvals" || path == "/api/v1/applications") {
 		return true
 	}
 	if path == "/api/v1/applications" && r.Method == http.MethodPost {
@@ -233,6 +233,9 @@ func ordinaryUserRouteAllowed(r *http.Request) bool {
 	if strings.HasPrefix(path, "/api/v1/instances/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/api/v1/instances/"), "/")
 		if r.Method == http.MethodGet && len(parts) == 1 && parts[0] != "" {
+			return true
+		}
+		if r.Method == http.MethodGet && len(parts) == 2 && parts[0] != "" && parts[1] == "metrics" {
 			return true
 		}
 		if r.Method == http.MethodPost && len(parts) == 2 && parts[0] != "" && (parts[1] == "actions" || parts[1] == "renew" || parts[1] == "restore") {

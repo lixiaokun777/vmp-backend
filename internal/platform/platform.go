@@ -85,6 +85,10 @@ type Domain struct {
 	Metadata           map[string]any `json:"metadata,omitempty"`
 	DeliveryStatus     string         `json:"delivery_status,omitempty"`
 	DeliveryMessage    string         `json:"delivery_message,omitempty"`
+	CPUUsagePercent    *float64       `json:"cpu_usage_percent,omitempty"`
+	MemoryUsageMB      *int           `json:"memory_usage_mb,omitempty"`
+	MemoryMetricSource string         `json:"memory_metric_source,omitempty"`
+	MetricsCollectedAt time.Time      `json:"metrics_collected_at,omitempty"`
 }
 
 type Check struct {
@@ -355,10 +359,28 @@ func (s *Service) Heartbeat(ctx context.Context, hostID string, hb Heartbeat) er
 		if err != nil {
 			return err
 		}
+		if freshInventory && instanceID != "" && ownership == "MANAGED" && (domain.CPUUsagePercent != nil || domain.MemoryUsageMB != nil) {
+			var cpu, memory any
+			if domain.CPUUsagePercent != nil && *domain.CPUUsagePercent >= 0 && *domain.CPUUsagePercent <= 100 {
+				cpu = *domain.CPUUsagePercent
+			}
+			if domain.MemoryUsageMB != nil && *domain.MemoryUsageMB >= 0 {
+				memory = *domain.MemoryUsageMB
+			}
+			if cpu != nil || memory != nil {
+				_, err = tx.Exec(ctx, `INSERT INTO instance_metrics(instance_id,collected_at,cpu_usage_percent,memory_usage_mb,memory_metric_source) VALUES($1::uuid,$2,$3,$4,$5) ON CONFLICT(instance_id,collected_at) DO UPDATE SET cpu_usage_percent=excluded.cpu_usage_percent,memory_usage_mb=excluded.memory_usage_mb,memory_metric_source=excluded.memory_metric_source`, instanceID, inventoryAt.Truncate(time.Minute), cpu, memory, domain.MemoryMetricSource)
+				if err != nil {
+					return err
+				}
+			}
+		}
 	}
 	if freshInventory {
 		_, err = tx.Exec(ctx, `DELETE FROM discovered_instances WHERE host_id=$1::uuid AND last_seen_at < $2`, hostID, inventoryAt)
 		if err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `DELETE FROM instance_metrics WHERE collected_at<now()-interval '7 days'`); err != nil {
 			return err
 		}
 	}
