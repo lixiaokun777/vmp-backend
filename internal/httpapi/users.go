@@ -57,7 +57,7 @@ func (a *API) createLocalUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		writeError(w, 500, "创建用户未完成，请重试")
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 201, map[string]any{"id": id, "username": input.Username, "source": "LOCAL"})
@@ -105,12 +105,12 @@ func (a *API) updateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	if !*input.Enabled {
 		if _, err := tx.Exec(r.Context(), `DELETE FROM user_sessions WHERE user_id=$1::uuid`, r.PathValue("id")); err != nil {
-			writeError(w, 500, "清理用户会话失败")
+			internalError(w, r, err)
 			return
 		}
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		writeError(w, 500, "更新用户未完成，请重试")
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"updated": true})
@@ -128,16 +128,29 @@ func (a *API) resetLocalUserPassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 422, err.Error())
 		return
 	}
-	tag, err := a.Service.DB.Exec(r.Context(), `UPDATE users SET password_hash=crypt($2,gen_salt('bf',12)),must_change_password=true,updated_at=now() WHERE id=$1::uuid AND source='LOCAL'`, r.PathValue("id"), input.Password)
+	tx, err := a.Service.DB.Begin(r.Context())
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	tag, err := tx.Exec(r.Context(), `UPDATE users SET password_hash=crypt($2,gen_salt('bf',12)),must_change_password=true,updated_at=now() WHERE id=$1::uuid AND source='LOCAL'`, r.PathValue("id"), input.Password)
+	if err != nil {
+		internalError(w, r, err)
 		return
 	}
 	if tag.RowsAffected() == 0 {
 		writeError(w, 422, "用户不存在或不是本地用户")
 		return
 	}
-	_, _ = a.Service.DB.Exec(r.Context(), `DELETE FROM user_sessions WHERE user_id=$1::uuid`, r.PathValue("id"))
+	if _, err = tx.Exec(r.Context(), `DELETE FROM user_sessions WHERE user_id=$1::uuid`, r.PathValue("id")); err != nil {
+		internalError(w, r, err)
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		internalError(w, r, err)
+		return
+	}
 	writeJSON(w, 200, map[string]any{"updated": true, "must_change_password": true})
 }
 
@@ -159,7 +172,7 @@ func (a *API) deleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('user-quota:'||lower($1),0))`, username); err != nil {
-		writeError(w, 500, "无法锁定用户资源")
+		internalError(w, r, err)
 		return
 	}
 	if err := tx.QueryRow(r.Context(), `SELECT username FROM users WHERE id=$1::uuid FOR UPDATE`, r.PathValue("id")).Scan(&username); err != nil {
@@ -168,7 +181,7 @@ func (a *API) deleteUser(w http.ResponseWriter, r *http.Request) {
 	}
 	var activeInstances int
 	if err := tx.QueryRow(r.Context(), `SELECT (SELECT count(*) FROM instances i JOIN applications ap ON ap.id=i.application_id WHERE lower(ap.applicant)=lower($1))+(SELECT count(*) FROM approval_requests WHERE lower(applicant)=lower($1) AND status IN ('PENDING','PROCESSING'))`, username).Scan(&activeInstances); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	if activeInstances > 0 {
@@ -185,7 +198,7 @@ func (a *API) deleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		writeError(w, 500, "删除用户未完成，请重试")
+		internalError(w, r, err)
 		return
 	}
 	if tag.RowsAffected() == 0 {

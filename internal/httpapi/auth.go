@@ -7,9 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 const sessionCookieName = "vmp_session"
@@ -78,6 +81,13 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 	var passwordOK bool
 	var ldapDN string
 	err := a.Service.DB.QueryRow(r.Context(), `SELECT id::text,username,display_name,email,role,source,enabled AND (source<>'LDAP' OR ldap_directory_present),must_change_password,coalesce(ldap_dn,''),CASE WHEN source='LOCAL' THEN password_hash=crypt($2,password_hash) ELSE false END FROM users WHERE lower(username)=lower($1) AND source=$3`, input.Username, input.Password, input.Source).Scan(&user.ID, &user.Username, &user.DisplayName, &user.Email, &user.Role, &user.Source, &enabled, &user.MustChangePassword, &ldapDN, &passwordOK)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// 与本地账号相同的 bcrypt 成本，未知账号也完成一次计算再返回统一失败。
+		var dummy string
+		if dummyErr := a.Service.DB.QueryRow(r.Context(), `SELECT crypt($1,'$2a$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW')`, input.Password).Scan(&dummy); dummyErr != nil {
+			slog.Error("登录哑计算失败", "error", dummyErr)
+		}
+	}
 	if err != nil || !enabled {
 		a.recordAudit(r.Context(), r, input.Username, "auth.login", "session", input.Username, "FAILED", map[string]any{"source": input.Source, "reason": "invalid_credentials_or_disabled"})
 		writeError(w, 401, "用户名或密码错误")
@@ -96,7 +106,7 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
-		writeError(w, 500, "无法创建登录会话")
+		internalError(w, r, err)
 		return
 	}
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
@@ -104,7 +114,7 @@ func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
 	expiresAt := time.Now().Add(a.SessionTTL)
 	remoteAddress := a.clientIP(r)
 	if _, err := a.Service.DB.Exec(r.Context(), `INSERT INTO user_sessions(token_hash,user_id,expires_at,remote_address,user_agent) VALUES($1,$2::uuid,$3,$4,$5)`, tokenHash[:], user.ID, expiresAt, remoteAddress, r.UserAgent()); err != nil {
-		writeError(w, 500, "无法创建登录会话")
+		internalError(w, r, err)
 		return
 	}
 	_, _ = a.Service.DB.Exec(r.Context(), `UPDATE users SET last_login_at=now(),updated_at=now() WHERE id=$1::uuid`, user.ID)
@@ -158,7 +168,7 @@ func (a *API) changeOwnPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := a.Service.DB.Exec(r.Context(), `UPDATE users SET password_hash=crypt($2,gen_salt('bf',12)),must_change_password=false,updated_at=now() WHERE id=$1::uuid`, user.ID, input.NewPassword); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {

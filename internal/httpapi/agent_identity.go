@@ -73,12 +73,12 @@ func (a *API) registerScopedAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		runtimeToken, err = generateAgentToken()
 		if err != nil {
-			writeError(w, 500, "无法生成宿主独立凭据")
+			internalError(w, r, err)
 			return
 		}
 		hash := sha256.Sum256([]byte(runtimeToken))
 		if _, err = tx.Exec(r.Context(), `INSERT INTO host_credentials(host_id,token_hash) VALUES($1::uuid,$2)`, hostID, hash[:]); err != nil {
-			writeError(w, 500, "无法保存宿主独立凭据")
+			internalError(w, r, err)
 			return
 		}
 	} else {
@@ -145,7 +145,7 @@ func (a *API) authorizeAgent(w http.ResponseWriter, r *http.Request) bool {
 func (a *API) rotateHostCredential(w http.ResponseWriter, r *http.Request) {
 	token, err := generateAgentToken()
 	if err != nil {
-		writeError(w, 500, "无法生成宿主凭据")
+		internalError(w, r, err)
 		return
 	}
 	hash := sha256.Sum256([]byte(token))
@@ -162,7 +162,7 @@ func (a *API) rotateHostCredential(w http.ResponseWriter, r *http.Request) {
 	}
 	var generation int64
 	if err = tx.QueryRow(r.Context(), `INSERT INTO host_credentials(host_id,token_hash) VALUES($1::uuid,$2) ON CONFLICT(host_id) DO UPDATE SET token_hash=excluded.token_hash,generation=host_credentials.generation+1,revoked_at=NULL,updated_at=now() RETURNING generation`, r.PathValue("id"), hash[:]).Scan(&generation); err != nil {
-		writeError(w, 500, "无法签发宿主凭据")
+		internalError(w, r, err)
 		return
 	}
 	if err = tx.Commit(r.Context()); err != nil {

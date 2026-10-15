@@ -35,7 +35,7 @@ func (a *API) registerGovernanceRoutes(mux *http.ServeMux) {
 func (a *API) platformPolicy(w http.ResponseWriter, r *http.Request) {
 	p, err := a.Service.GetPolicy(r.Context())
 	if err != nil {
-		writeError(w, 500, "读取平台策略失败")
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, p)
@@ -66,7 +66,7 @@ func (a *API) autoRenew(w http.ResponseWriter, r *http.Request) {
 	err := a.Service.DB.QueryRow(r.Context(), `SELECT jsonb_build_object('enabled',enabled,'hours',hours,'max_renewals',max_renewals,'renewed_count',renewed_count,'last_error',last_error) FROM instance_auto_renew WHERE instance_id=$1::uuid`, r.PathValue("id")).Scan(&raw)
 	p, pErr := a.Service.GetPolicy(r.Context())
 	if pErr != nil {
-		writeError(w, 500, "读取自动续期上限失败")
+		internalError(w, r, pErr)
 		return
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -74,12 +74,12 @@ func (a *API) autoRenew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, 500, "读取自动续期配置失败")
+		internalError(w, r, err)
 		return
 	}
 	var out map[string]any
 	if json.Unmarshal(raw, &out) != nil {
-		writeError(w, 500, "自动续期配置无效")
+		internalError(w, r, errors.New("自动续期配置无效"))
 		return
 	}
 	out["platform_enabled"], out["platform_max_count"], out["platform_max_hours"] = p.AutoRenewEnabled, p.AutoRenewMaxCount, p.AutoRenewHours
@@ -110,12 +110,12 @@ func (a *API) approvalDelegation(w http.ResponseWriter, r *http.Request) {
 	if errors.Is(err, pgx.ErrNoRows) {
 		raw = json.RawMessage(`null`)
 	} else if err != nil {
-		writeError(w, 500, "读取代理配置失败")
+		internalError(w, r, err)
 		return
 	}
 	admins, err := queryRawList(r, a.Service.DB, `SELECT jsonb_build_object('username',username,'display_name',display_name) FROM users WHERE role='ADMIN' AND enabled AND (source<>'LDAP' OR ldap_directory_present) ORDER BY username`)
 	if err != nil {
-		writeError(w, 500, "读取管理员列表失败")
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"delegation": raw, "administrators": admins})
@@ -134,12 +134,12 @@ func (a *API) updateApprovalDelegation(w http.ResponseWriter, r *http.Request) {
 	in.Delegate = strings.TrimSpace(in.Delegate)
 	tx, err := a.Service.DB.Begin(r.Context())
 	if err != nil {
-		writeError(w, 500, "保存代理配置失败")
+		internalError(w, r, err)
 		return
 	}
 	defer tx.Rollback(r.Context())
 	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(8673230)`); err != nil {
-		writeError(w, 500, "锁定代理配置失败")
+		internalError(w, r, err)
 		return
 	}
 	if in.Delegate == "" {
@@ -161,11 +161,11 @@ func (a *API) updateApprovalDelegation(w http.ResponseWriter, r *http.Request) {
 		err = tx.Commit(r.Context())
 	}
 	if err != nil {
-		writeError(w, 500, "保存代理配置失败")
+		internalError(w, r, err)
 		return
 	}
 	if err = a.Service.RefreshDelegations(r.Context()); err != nil {
-		writeError(w, 500, "配置已保存但待审批路由刷新失败，请重试")
+		internalError(w, r, err)
 		return
 	}
 	a.recordAudit(r.Context(), r, u.Username, "approval.delegation.configure", "configuration", u.Username, "SUCCESS", in)
@@ -182,12 +182,12 @@ func (a *API) transferApproval(w http.ResponseWriter, r *http.Request) {
 	}
 	tx, err := a.Service.DB.Begin(r.Context())
 	if err != nil {
-		writeError(w, 500, "转交失败")
+		internalError(w, r, err)
 		return
 	}
 	defer tx.Rollback(r.Context())
 	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(8673230)`); err != nil {
-		writeError(w, 500, "锁定审批路由失败")
+		internalError(w, r, err)
 		return
 	}
 	var valid bool
@@ -210,7 +210,7 @@ func (a *API) transferApproval(w http.ResponseWriter, r *http.Request) {
 		err = tx.Commit(r.Context())
 	}
 	if err != nil {
-		writeError(w, 500, "转交失败")
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"assigned_reviewer": in.Reviewer})
@@ -246,13 +246,13 @@ func (a *API) createHistoryArchive(w http.ResponseWriter, r *http.Request) {
 	}
 	tx, err := a.Service.DB.Begin(r.Context())
 	if err != nil {
-		writeError(w, 500, "创建归档失败")
+		internalError(w, r, err)
 		return
 	}
 	defer tx.Rollback(r.Context())
 	p, err := a.Service.GetPolicyTx(r.Context(), tx)
 	if err != nil {
-		writeError(w, 500, "读取历史策略失败")
+		internalError(w, r, err)
 		return
 	}
 	src, err := sourceForArchive(in.Category, p)
@@ -265,7 +265,7 @@ func (a *API) createHistoryArchive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(8673231)`); err != nil {
-		writeError(w, 500, "锁定归档失败")
+		internalError(w, r, err)
 		return
 	}
 	cutoff := time.Now().Add(-time.Duration(src.days) * 24 * time.Hour)
@@ -276,7 +276,7 @@ func (a *API) createHistoryArchive(w http.ResponseWriter, r *http.Request) {
 	sql := fmt.Sprintf(`SELECT t.id::text,%s,encode(digest(to_jsonb(t)::text,'sha256'),'hex') FROM %s t WHERE created_at<$1 AND %s AND NOT EXISTS(SELECT 1 FROM history_archives ar WHERE ar.category=$2 AND ar.purged_at IS NULL AND t.id::text=ANY(ar.source_ids)) ORDER BY created_at,id LIMIT 5000 FOR SHARE`, jsonExpression, src.table, src.condition)
 	rows, err := tx.Query(r.Context(), sql, cutoff, in.Category)
 	if err != nil {
-		writeError(w, 500, "读取待归档历史失败")
+		internalError(w, r, err)
 		return
 	}
 	var data bytes.Buffer
@@ -305,7 +305,7 @@ func (a *API) createHistoryArchive(w http.ResponseWriter, r *http.Request) {
 	rows.Close()
 	closeErr := z.Close()
 	if err != nil || rowErr != nil || closeErr != nil {
-		writeError(w, 500, "生成历史归档失败")
+		internalError(w, r, errors.Join(err, rowErr, closeErr))
 		return
 	}
 	if len(ids) == 0 {
@@ -322,7 +322,7 @@ func (a *API) createHistoryArchive(w http.ResponseWriter, r *http.Request) {
 		err = tx.Commit(r.Context())
 	}
 	if err != nil {
-		writeError(w, 500, "保存归档失败")
+		internalError(w, r, err)
 		return
 	}
 	a.recordAudit(r.Context(), r, u.Username, "history.archive", "history", id, "SUCCESS", map[string]any{"category": in.Category, "row_count": len(ids), "checksum": checksum})
@@ -352,7 +352,7 @@ func (a *API) purgeHistoryArchive(w http.ResponseWriter, r *http.Request) {
 	}
 	tx, err := a.Service.DB.Begin(r.Context())
 	if err != nil {
-		writeError(w, 500, "清理失败")
+		internalError(w, r, err)
 		return
 	}
 	defer tx.Rollback(r.Context())
@@ -371,7 +371,7 @@ func (a *API) purgeHistoryArchive(w http.ResponseWriter, r *http.Request) {
 	}
 	p, err := a.Service.GetPolicyTx(r.Context(), tx)
 	if err != nil {
-		writeError(w, 500, "读取保留策略失败")
+		internalError(w, r, err)
 		return
 	}
 	src, err := sourceForArchive(category, p)
@@ -390,7 +390,7 @@ func (a *API) purgeHistoryArchive(w http.ResponseWriter, r *http.Request) {
 		sql += ` RETURNING t.instance_id::text`
 		rows, deleteErr := tx.Query(r.Context(), sql, ids, cutoff, hashes)
 		if deleteErr != nil {
-			writeError(w, 500, "清理失败，已回滚")
+			internalError(w, r, deleteErr)
 			return
 		}
 		var eventIDs []string
@@ -408,24 +408,24 @@ func (a *API) purgeHistoryArchive(w http.ResponseWriter, r *http.Request) {
 		rowsErr := rows.Err()
 		rows.Close()
 		if deleteErr != nil || rowsErr != nil {
-			writeError(w, 500, "清理失败，已回滚")
+			internalError(w, r, errors.Join(deleteErr, rowsErr))
 			return
 		}
 		if _, deleteErr = tx.Exec(r.Context(), `DELETE FROM platform_notification_outbox WHERE id=ANY($1::uuid[]) AND status IN ('SENT','FAILED','CANCELLED') AND created_at<$2`, eventIDs, cutoff); deleteErr != nil {
-			writeError(w, 500, "清理失败，已回滚")
+			internalError(w, r, deleteErr)
 			return
 		}
 		if _, err = tx.Exec(r.Context(), `UPDATE history_archives SET purged_at=now() WHERE id=$1::uuid`, r.PathValue("id")); err != nil {
-			writeError(w, 500, "清理失败，已回滚")
+			internalError(w, r, err)
 			return
 		}
 		u, _ := userFromRequest(r)
 		if _, err = tx.Exec(r.Context(), `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'history.purge','history',$2,jsonb_build_object('category',$3::text,'deleted_count',$4::integer,'checksum',$5::text))`, u.Username, r.PathValue("id"), category, int(deletedCount), checksum); err != nil {
-			writeError(w, 500, "清理失败，已回滚")
+			internalError(w, r, err)
 			return
 		}
 		if err = tx.Commit(r.Context()); err != nil {
-			writeError(w, 500, "清理失败，已回滚")
+			internalError(w, r, err)
 			return
 		}
 		writeJSON(w, 200, map[string]any{"deleted_count": deletedCount, "archive_retained": true})
@@ -443,7 +443,7 @@ func (a *API) purgeHistoryArchive(w http.ResponseWriter, r *http.Request) {
 		err = tx.Commit(r.Context())
 	}
 	if err != nil {
-		writeError(w, 500, "清理失败，已回滚")
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"deleted_count": tag.RowsAffected(), "archive_retained": true})

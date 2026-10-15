@@ -81,6 +81,8 @@ func platformEventEnabled(c notificationSettings, kind string) bool {
 		return c.NotifyFailures
 	case "HOST_OFFLINE", "HOST_RECOVERED":
 		return c.NotifyHostAlerts
+	case "PLATFORM_HEALTH":
+		return c.NotifyPlatformHealth
 	}
 	return false
 }
@@ -88,7 +90,7 @@ func platformEventEnabled(c notificationSettings, kind string) bool {
 func (a *API) dispatchPlatformNotifications(ctx context.Context) error {
 	tx, err := a.beginNotification(ctx)
 	if err != nil {
-		return nil
+		return notificationBeginError(err)
 	}
 	defer tx.Rollback(ctx)
 	c, err := a.loadNotificationSettings(ctx, tx)

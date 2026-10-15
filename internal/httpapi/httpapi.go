@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"vmp-backend/internal/background"
 	"vmp-backend/internal/platform"
 )
 
@@ -27,6 +28,7 @@ type API struct {
 	SettingsEncryptionKey []byte
 	ConsoleSigningKey     []byte
 	LDAP                  LDAPConfig
+	Background            *background.Monitor
 }
 
 func (a *API) Handler() http.Handler {
@@ -136,7 +138,7 @@ func (a *API) summary(w http.ResponseWriter, r *http.Request) {
 		(SELECT count(*) FROM approval_requests WHERE status='PENDING' AND expires_at>now())`)
 	var h, running, provisioning, apps, usedMem, totalMem, pendingApprovals int
 	if err := row.Scan(&h, &running, &provisioning, &apps, &usedMem, &totalMem, &pendingApprovals); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"active_hosts": h, "running_instances": running, "provisioning_instances": provisioning, "applications": apps, "reserved_memory_mb": usedMem, "allocatable_memory_mb": totalMem, "pending_approvals": pendingApprovals})
@@ -197,7 +199,7 @@ func (a *API) instanceDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	var fields, more map[string]any
 	if json.Unmarshal(instance, &fields) != nil || json.Unmarshal(extra, &more) != nil {
-		writeError(w, 500, "实例详情数据无效")
+		internalError(w, r, errors.New("实例详情数据无效"))
 		return
 	}
 	for key, value := range more {
@@ -211,12 +213,12 @@ func (a *API) instanceDetail(w http.ResponseWriter, r *http.Request) {
 	instance, _ = json.Marshal(fields)
 	tasks, err := queryRawList(r, a.Service.DB, `SELECT jsonb_build_object('id',id,'task_type',task_type,'status',status,'attempt',attempt,'max_attempts',max_attempts,'error_code',coalesce(result->>'error_code',''),'error_message',error_message,'created_at',created_at,'completed_at',completed_at) FROM tasks WHERE resource_id=$1::uuid OR (task_type='PROBE_IP_ADDRESS' AND payload->>'retry_instance_id'=($1::uuid)::text) ORDER BY created_at DESC`, r.PathValue("id"))
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	audits, err := queryRawList(r, a.Service.DB, `SELECT jsonb_build_object('action',action,'actor',actor,'detail',detail,'created_at',created_at) FROM audit_logs WHERE resource_type='instance' AND resource_id=($1::uuid)::text ORDER BY created_at DESC`, r.PathValue("id"))
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"instance": instance, "tasks": tasks, "audit_logs": audits})
@@ -253,7 +255,7 @@ func (a *API) queryList(w http.ResponseWriter, r *http.Request, sql string) {
 func (a *API) queryListArgs(w http.ResponseWriter, r *http.Request, sql string, args ...any) {
 	rows, err := a.Service.DB.Query(r.Context(), sql, args...)
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	defer rows.Close()
@@ -261,7 +263,7 @@ func (a *API) queryListArgs(w http.ResponseWriter, r *http.Request, sql string, 
 	for rows.Next() {
 		var raw []byte
 		if err := rows.Scan(&raw); err != nil {
-			writeError(w, 500, err.Error())
+			internalError(w, r, err)
 			return
 		}
 		items = append(items, raw)
@@ -348,7 +350,7 @@ func (a *API) createNetwork(w http.ResponseWriter, r *http.Request) {
 	addresses, _ := networkRangeAddresses(in)
 	tx, err := a.Service.DB.Begin(r.Context())
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	defer tx.Rollback(r.Context())
@@ -363,7 +365,7 @@ func (a *API) createNetwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 201, map[string]any{"id": id, "ip_range_start": in.RangeStart, "ip_range_end": in.RangeEnd, "total": len(addresses)})
@@ -382,7 +384,7 @@ func (a *API) updateNetwork(w http.ResponseWriter, r *http.Request) {
 	addresses, _ := networkRangeAddresses(in)
 	tx, err := a.Service.DB.Begin(r.Context())
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	defer tx.Rollback(r.Context())
@@ -393,19 +395,19 @@ func (a *API) updateNetwork(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := tx.Query(r.Context(), `SELECT id FROM ip_addresses WHERE network_id=$1::uuid FOR UPDATE`, existingID)
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	for rows.Next() {
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	var occupiedOutside int
 	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM ip_addresses WHERE network_id=$1::uuid AND status<>'FREE' AND (NOT (address BETWEEN $2::inet AND $3::inet) OR address=$4::inet)`, existingID, in.RangeStart, in.RangeEnd, in.Gateway).Scan(&occupiedOutside); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	if occupiedOutside > 0 {
@@ -422,7 +424,7 @@ func (a *API) updateNetwork(w http.ResponseWriter, r *http.Request) {
 	}
 	var actualRangeSize int
 	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM ip_addresses WHERE network_id=$1::uuid AND address BETWEEN $2::inet AND $3::inet`, existingID, in.RangeStart, in.RangeEnd).Scan(&actualRangeSize); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	if actualRangeSize != len(addresses) {
@@ -439,7 +441,7 @@ func (a *API) updateNetwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": existingID, "updated": true, "ip_range_start": in.RangeStart, "ip_range_end": in.RangeEnd, "total": len(addresses)})
@@ -448,7 +450,7 @@ func (a *API) updateNetwork(w http.ResponseWriter, r *http.Request) {
 func (a *API) deleteNetwork(w http.ResponseWriter, r *http.Request) {
 	tx, err := a.Service.DB.Begin(r.Context())
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	defer tx.Rollback(r.Context())
@@ -459,7 +461,7 @@ func (a *API) deleteNetwork(w http.ResponseWriter, r *http.Request) {
 	}
 	var occupied int
 	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM ip_addresses WHERE network_id=$1::uuid AND status<>'FREE'`, r.PathValue("id")).Scan(&occupied); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	if occupied > 0 {
@@ -475,7 +477,7 @@ func (a *API) deleteNetwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": r.PathValue("id"), "name": name, "deleted": true})
@@ -548,7 +550,7 @@ func (a *API) deleteIPRange(w http.ResponseWriter, r *http.Request) {
 	}
 	tx, err := a.Service.DB.Begin(r.Context())
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	defer tx.Rollback(r.Context())
@@ -573,7 +575,7 @@ func (a *API) deleteIPRange(w http.ResponseWriter, r *http.Request) {
 		var status string
 		if err := rows.Scan(&status); err != nil {
 			rows.Close()
-			writeError(w, 500, err.Error())
+			internalError(w, r, err)
 			return
 		}
 		count++
@@ -594,7 +596,7 @@ func (a *API) deleteIPRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"deleted": tag.RowsAffected()})
@@ -653,7 +655,7 @@ func (a *API) hostQuota(w http.ResponseWriter, r *http.Request) {
 func (a *API) deleteHost(w http.ResponseWriter, r *http.Request) {
 	tx, err := a.Service.DB.Begin(r.Context())
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	defer tx.Rollback(r.Context())
@@ -668,11 +670,11 @@ func (a *API) deleteHost(w http.ResponseWriter, r *http.Request) {
 	}
 	var activeInstances, activeTasks int
 	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM instances WHERE host_id=$1::uuid AND lifecycle_status<>'RELEASED'`, r.PathValue("id")).Scan(&activeInstances); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM tasks WHERE host_id=$1::uuid AND status IN ('PENDING','RUNNING')`, r.PathValue("id")).Scan(&activeTasks); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	if activeInstances > 0 || activeTasks > 0 {
@@ -692,7 +694,7 @@ func (a *API) deleteHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": r.PathValue("id"), "name": name, "deleted": true})
@@ -876,16 +878,16 @@ func (a *API) updateImage(w http.ResponseWriter, r *http.Request) {
 		}
 		if changed {
 			if _, err := tx.Exec(r.Context(), `UPDATE host_images SET status='STALE',error='镜像定义已变更，需要重新同步或探测',verified_at=NULL WHERE image_id=$1`, r.PathValue("id")); err != nil {
-				writeError(w, 500, "镜像就绪记录更新失败")
+				internalError(w, r, err)
 				return
 			}
 		}
 		if _, err := tx.Exec(r.Context(), `UPDATE images SET enabled=desired_enabled AND (source_type='local' OR sync_status='READY') WHERE id=$1`, r.PathValue("id")); err != nil {
-			writeError(w, 500, "保存镜像状态失败")
+			internalError(w, r, err)
 			return
 		}
 		if err := tx.QueryRow(r.Context(), `SELECT enabled,sync_status FROM images WHERE id=$1`, r.PathValue("id")).Scan(&enabled, &syncStatus); err != nil {
-			writeError(w, 500, "读取镜像更新结果失败")
+			internalError(w, r, err)
 			return
 		}
 		if err := tx.Commit(r.Context()); err != nil {
@@ -1109,7 +1111,7 @@ func (a *API) agentTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, task)
@@ -1128,7 +1130,7 @@ func (a *API) agentTaskResult(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, platform.ErrTaskClaimConflict) {
 			writeError(w, 409, "任务领取凭据已失效或与当前执行不匹配")
 		} else {
-			writeError(w, 500, "任务结果保存失败，请重试")
+			internalError(w, r, err)
 		}
 		return
 	}
@@ -1151,7 +1153,7 @@ func (a *API) renewAgentTaskLease(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, platform.ErrTaskClaimConflict) {
 			writeError(w, 409, "任务领取凭据已失效或与当前执行不匹配")
 		} else {
-			writeError(w, 500, "任务执行租约续期失败，请重试")
+			internalError(w, r, err)
 		}
 		return
 	}
@@ -1168,7 +1170,16 @@ func tokenOK(r *http.Request, want, header string) bool {
 	return subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) == 1
 }
 func writeError(w http.ResponseWriter, status int, message string) {
+	if status >= 500 {
+		slog.Error("接口操作失败", "status", status, "reason", message)
+		message = "服务器内部错误，请稍后重试"
+	}
 	writeJSON(w, status, map[string]any{"error": message})
+}
+
+func internalError(w http.ResponseWriter, r *http.Request, err error) {
+	slog.Error("接口内部错误", "method", r.Method, "path", r.URL.Path, "error", err)
+	writeError(w, http.StatusInternalServerError, "服务器内部错误，请稍后重试")
 }
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)

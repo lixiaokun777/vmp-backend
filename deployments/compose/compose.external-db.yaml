@@ -6,6 +6,7 @@ services:
     restart: unless-stopped
     environment:
       LISTEN_ADDR: :8080
+      LOG_LEVEL: ${LOG_LEVEL:-info}
       DATABASE_URL: ${DATABASE_URL}
       AGENT_BOOTSTRAP_TOKEN: ${AGENT_BOOTSTRAP_TOKEN:?请生成至少32字符随机引导令牌}
       BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME}

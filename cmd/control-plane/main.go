@@ -12,11 +12,17 @@ import (
 	"syscall"
 	"time"
 
+	"vmp-backend/internal/background"
 	"vmp-backend/internal/httpapi"
+	"vmp-backend/internal/logging"
 	"vmp-backend/internal/platform"
 )
 
 func main() {
+	if err := logging.Init(os.Getenv("LOG_LEVEL")); err != nil {
+		slog.Error("日志配置无效", "error", err)
+		os.Exit(1)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	bootstrapToken := os.Getenv("AGENT_BOOTSTRAP_TOKEN")
@@ -39,7 +45,6 @@ func main() {
 		os.Exit(1)
 	}
 	defer service.DB.Close()
-	go platform.StartReconciler(ctx, service)
 	api := &httpapi.API{
 		Service:               service,
 		BootstrapToken:        bootstrapToken,
@@ -62,6 +67,9 @@ func main() {
 			StartTLS:        envBool("LDAP_START_TLS", false),
 		},
 	}
+	api.Background = &background.Monitor{Enqueue: api.EnqueueHealthAlert}
+	service.ObserveBackground = api.Background.Observe
+	go platform.StartReconciler(ctx, service)
 	if err := httpapi.EnsureBootstrapAdmin(ctx, api, os.Getenv("BOOTSTRAP_ADMIN_USERNAME"), os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")); err != nil {
 		slog.Error("bootstrap administrator failed", "error", err)
 		os.Exit(1)

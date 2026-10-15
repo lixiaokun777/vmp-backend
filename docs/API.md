@@ -1,5 +1,7 @@
 # API 说明
 
+0.7.0 验收候选：通知配置 GET/PUT 增加可选 `notify_platform_health`，缺省开启、旧客户端省略时保留原值。通知历史 `kind=PLATFORM_HEALTH` 表示后台连续失败告警。全部 5xx 使用固定中文错误响应，原始异常只记服务端日志；4xx 校验提示不变。既有任务协议只增加 HOST_DISK_INSUFFICIENT 错误码，其他字段和鉴权语义不变。
+
 ## 个人概览、监控与交付诊断（未发布）
 
 - `GET /api/v1/me/overview`：当前登录用户的个人概览，返回 `active_instances`、`quota_instances`、已占 CPU/内存/磁盘、最近到期、24 小时内到期数及平台配置的用户额度。服务端固定按会话用户过滤，普通用户不能传用户名查看他人数据。

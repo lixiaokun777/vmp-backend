@@ -44,7 +44,7 @@ func (config LDAPConfig) Enabled() bool {
 func (a *API) ldapStatus(w http.ResponseWriter, r *http.Request) {
 	config, err := a.loadLDAPConfig(r.Context())
 	if err != nil {
-		writeError(w, 500, "读取 LDAP 配置失败："+err.Error())
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, ldapConfigResponse(config))
@@ -88,7 +88,7 @@ func (a *API) updateLDAPConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	var encryptedPassword []byte
 	if err := a.Service.DB.QueryRow(r.Context(), `SELECT bind_password_ciphertext FROM ldap_settings WHERE singleton=true`).Scan(&encryptedPassword); err != nil {
-		writeError(w, 500, "读取 LDAP 密码配置失败")
+		internalError(w, r, err)
 		return
 	}
 	if input.ClearPassword {
@@ -105,7 +105,7 @@ func (a *API) updateLDAPConfig(w http.ResponseWriter, r *http.Request) {
 	user, _ := userFromRequest(r)
 	_, err := a.Service.DB.Exec(r.Context(), `UPDATE ldap_settings SET configured=true,enabled=$1,url=$2,start_tls=$3,bind_dn=$4,bind_password_ciphertext=$5,base_dn=$6,login_filter=$7,sync_filter=$8,username_attribute=$9,display_name_attribute=$10,email_attribute=$11,updated_by=$12,updated_at=now() WHERE singleton=true`, config.Active, config.URL, config.StartTLS, config.BindDN, encryptedPassword, config.BaseDN, config.LoginFilter, config.SyncFilter, config.UsernameAttr, config.DisplayNameAttr, config.EmailAttr, user.Username)
 	if err != nil {
-		writeError(w, 500, "保存 LDAP 配置失败："+err.Error())
+		internalError(w, r, err)
 		return
 	}
 	response := ldapConfigResponse(config)
@@ -119,7 +119,7 @@ func (a *API) ldapTest(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(ctx)
 	config, err := a.loadLDAPConfig(r.Context())
 	if err != nil {
-		writeError(w, 500, "读取 LDAP 配置失败："+err.Error())
+		internalError(w, r, err)
 		return
 	}
 	if !config.Enabled() {
@@ -152,7 +152,7 @@ func (a *API) ldapSync(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(ctx)
 	config, err := a.loadLDAPConfig(r.Context())
 	if err != nil {
-		writeError(w, 500, "读取 LDAP 配置失败："+err.Error())
+		internalError(w, r, err)
 		return
 	}
 	if !config.Enabled() {
@@ -184,7 +184,7 @@ func (a *API) ldapSync(w http.ResponseWriter, r *http.Request) {
 	current, _ := userFromRequest(r)
 	tx, err := a.beginUserAdministration(r.Context(), current.ID)
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	defer tx.Rollback(r.Context())
@@ -205,7 +205,7 @@ func (a *API) ldapSync(w http.ResponseWriter, r *http.Request) {
 		email := strings.TrimSpace(entry.GetAttributeValue(config.EmailAttr))
 		tag, err := tx.Exec(r.Context(), `INSERT INTO users(username,display_name,email,role,source,ldap_dn,enabled,ldap_directory_present) VALUES($1,$2,$3,'USER','LDAP',$4,true,true) ON CONFLICT (lower(username)) DO UPDATE SET display_name=excluded.display_name,email=excluded.email,ldap_dn=excluded.ldap_dn,ldap_directory_present=true,updated_at=now() WHERE users.source='LDAP'`, username, displayName, email, entry.DN)
 		if err != nil {
-			writeError(w, 500, err.Error())
+			internalError(w, r, err)
 			return
 		}
 		if tag.RowsAffected() > 0 {
@@ -216,15 +216,15 @@ func (a *API) ldapSync(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if _, err := tx.Exec(r.Context(), `UPDATE users SET ldap_directory_present=false,updated_at=now() WHERE source='LDAP' AND NOT (lower(username)=ANY($1::text[]))`, syncedUsernames); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	if _, err := tx.Exec(r.Context(), `DELETE FROM user_sessions WHERE user_id IN (SELECT id FROM users WHERE source='LDAP' AND (NOT enabled OR NOT ldap_directory_present))`); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"synced": synced, "skipped": skipped, "found": len(result.Entries)})

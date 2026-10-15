@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -43,7 +44,9 @@ func (a *API) recordAudit(ctx context.Context, r *http.Request, actor, action, r
 		payload = []byte(`{}`)
 	}
 	requestID := r.Header.Get("X-Request-ID")
-	_, _ = a.Service.DB.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail,outcome,source_ip,user_agent,request_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, actor, action, resourceType, resourceID, payload, outcome, a.clientIP(r), r.UserAgent(), requestID)
+	if _, auditErr := a.Service.DB.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail,outcome,source_ip,user_agent,request_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, actor, action, resourceType, resourceID, payload, outcome, a.clientIP(r), r.UserAgent(), requestID); auditErr != nil {
+		slog.Warn("审计或操作记录写入失败", "error", auditErr)
+	}
 }
 
 // auditMutation 只补齐管理类变更。申请和实例生命周期由业务事务自身记录，避免重复。
@@ -167,19 +170,19 @@ func (a *API) auditLogs(w http.ResponseWriter, r *http.Request) {
 	where := " WHERE " + strings.Join(conditions, " AND ")
 	var total int
 	if err := a.Service.DB.QueryRow(r.Context(), "SELECT count(*) FROM audit_logs"+where, args...).Scan(&total); err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	listArgs := append(append([]any{}, args...), pageSize, (page-1)*pageSize)
 	rows, err := queryRawList(r, a.Service.DB, `SELECT jsonb_build_object('id',id,'actor',actor,'action',action,'resource_type',resource_type,'resource_id',resource_id,'outcome',outcome,'source_ip',source_ip,'user_agent',user_agent,'request_id',request_id,'detail',detail,'created_at',created_at) FROM audit_logs`+where+fmt.Sprintf(" ORDER BY created_at DESC,id DESC LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2), listArgs...)
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	// 筛选项由真实审计数据生成，新增动作后前端无需同步硬编码。
 	actionRows, err := a.Service.DB.Query(r.Context(), `SELECT DISTINCT action FROM audit_logs ORDER BY action`)
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	defer actionRows.Close()
@@ -192,7 +195,7 @@ func (a *API) auditLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	resourceRows, err := a.Service.DB.Query(r.Context(), `SELECT DISTINCT resource_type FROM audit_logs ORDER BY resource_type`)
 	if err != nil {
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	defer resourceRows.Close()

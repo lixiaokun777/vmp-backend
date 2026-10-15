@@ -62,7 +62,7 @@ func (a *API) createConsoleSession(w http.ResponseWriter, r *http.Request) {
 	}
 	sessionBytes := make([]byte, 18)
 	if _, err := rand.Read(sessionBytes); err != nil {
-		writeError(w, 500, "无法创建控制台会话")
+		internalError(w, r, err)
 		return
 	}
 	// 五分钟用于覆盖弹窗放行和人工操作延迟；真正的安全边界由服务端一次性核销保证。
@@ -73,13 +73,13 @@ func (a *API) createConsoleSession(w http.ResponseWriter, r *http.Request) {
 	ticket := consoleTicket{SessionID: base64.RawURLEncoding.EncodeToString(sessionBytes), HostID: hostID, Instance: r.PathValue("id"), Domain: name, Mode: input.Mode, Actor: user.Username, ExpiresAt: expiresAt.Unix()}
 	_, _ = a.Service.DB.Exec(r.Context(), `DELETE FROM console_sessions WHERE expires_at<now()-interval '1 day'`)
 	if _, err := a.Service.DB.Exec(r.Context(), `INSERT INTO console_sessions(id,host_id,instance_id,domain,mode,actor,expires_at) VALUES($1,$2::uuid,$3::uuid,$4,$5,$6,$7)`, ticket.SessionID, hostID, ticket.Instance, ticket.Domain, ticket.Mode, ticket.Actor, expiresAt); err != nil {
-		writeError(w, 500, "无法保存控制台会话")
+		internalError(w, r, err)
 		return
 	}
 	signed, err := signConsoleTicket(ticket, a.ConsoleSigningKey)
 	if err != nil {
 		_, _ = a.Service.DB.Exec(r.Context(), `DELETE FROM console_sessions WHERE id=$1 AND used_at IS NULL`, ticket.SessionID)
-		writeError(w, 500, err.Error())
+		internalError(w, r, err)
 		return
 	}
 	values := url.Values{}
@@ -108,7 +108,7 @@ func (a *API) consumeConsoleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, 500, "无法核销控制台票据")
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"consumed": true})

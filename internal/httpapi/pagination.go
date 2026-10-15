@@ -48,7 +48,7 @@ func (a *API) queryPage(w http.ResponseWriter, r *http.Request, itemSQL, fromSQL
 	defer tx.Rollback(r.Context())
 	var total int
 	if err = tx.QueryRow(r.Context(), "SELECT count(*) "+fromSQL+filter.where(), filter.args...).Scan(&total); err != nil {
-		writeError(w, 500, "读取列表总数失败")
+		internalError(w, r, err)
 		return
 	}
 	maxPage := max(1, (total+size-1)/size)
@@ -56,14 +56,14 @@ func (a *API) queryPage(w http.ResponseWriter, r *http.Request, itemSQL, fromSQL
 	args := append(append([]any{}, filter.args...), size, (page-1)*size)
 	items, err := queryRawList(r, tx, "SELECT "+itemSQL+" "+fromSQL+filter.where()+" "+orderSQL+fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(filter.args)+1, len(filter.args)+2), args...)
 	if err != nil {
-		writeError(w, 500, "读取列表记录失败")
+		internalError(w, r, err)
 		return
 	}
 	response := map[string]any{"items": items, "total": total, "page": page, "page_size": size}
 	for _, extra := range extras {
 		var value int
 		if err := tx.QueryRow(r.Context(), extra.query, extra.args...).Scan(&value); err != nil {
-			writeError(w, 500, "读取列表汇总失败")
+			internalError(w, r, err)
 			return
 		}
 		response[extra.key] = value

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 	"time"
@@ -122,7 +123,9 @@ func (s *Service) insertApproval(ctx context.Context, actor, requestType, instan
 		return nil, err
 	}
 	detail, _ := json.Marshal(map[string]any{"request_no": requestNo, "request_type": requestType, "requested_hours": hours})
-	_, _ = s.DB.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'approval.submit','approval',$2,$3)`, actor, id, detail)
+	if _, auditErr := s.DB.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'approval.submit','approval',$2,$3)`, actor, id, detail); auditErr != nil {
+		slog.Warn("审计或操作记录写入失败", "error", auditErr)
+	}
 	return map[string]any{"id": id, "request_no": requestNo, "request_type": requestType, "requested_hours": hours, "status": "PENDING", "expires_at": expiresAt, "approval_required": true}, nil
 }
 
@@ -178,7 +181,9 @@ func (s *Service) restoreInstanceTx(ctx context.Context, tx pgx.Tx, actor string
 		return nil, err
 	}
 	detail, _ := json.Marshal(map[string]any{"hours": hours, "reason": reason, "expires_at": expiresAt, "original_ip_retained": true})
-	_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.restore','instance',$2,$3)`, actor, instanceID, detail)
+	if _, auditErr := tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.restore','instance',$2,$3)`, actor, instanceID, detail); auditErr != nil {
+		slog.Warn("审计或操作记录写入失败", "error", auditErr)
+	}
 	return map[string]any{"id": instanceID, "status": "STARTING", "expires_at": expiresAt, "approval_required": false}, nil
 }
 
@@ -311,7 +316,9 @@ func (s *Service) WithdrawApproval(ctx context.Context, actor, approvalID string
 	if tag.RowsAffected() == 0 {
 		return errors.New("审批单不存在、已处理或已超时")
 	}
-	_, _ = s.DB.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'approval.withdraw','approval',$2,'{}'::jsonb)`, actor, approvalID)
+	if _, auditErr := s.DB.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'approval.withdraw','approval',$2,'{}'::jsonb)`, actor, approvalID); auditErr != nil {
+		slog.Warn("审计或操作记录写入失败", "error", auditErr)
+	}
 	return nil
 }
 
@@ -352,8 +359,12 @@ func (s *Service) ResubmitApprovalShort(ctx context.Context, actor string, admin
 		return nil, err
 	}
 	detail, _ := json.Marshal(map[string]any{"hours": hours, "reason": reason})
-	_, _ = s.DB.Exec(ctx, `UPDATE approval_requests SET result=result||jsonb_build_object('short_resubmitted',true,'short_hours',$1::integer),updated_at=now() WHERE id=$2::uuid`, hours, approvalID)
-	_, _ = s.DB.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'approval.resubmit_short','approval',$2,$3)`, actor, approvalID, detail)
+	if _, auditErr := s.DB.Exec(ctx, `UPDATE approval_requests SET result=result||jsonb_build_object('short_resubmitted',true,'short_hours',$1::integer),updated_at=now() WHERE id=$2::uuid`, hours, approvalID); auditErr != nil {
+		slog.Warn("审计或操作记录写入失败", "error", auditErr)
+	}
+	if _, auditErr := s.DB.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'approval.resubmit_short','approval',$2,$3)`, actor, approvalID, detail); auditErr != nil {
+		slog.Warn("审计或操作记录写入失败", "error", auditErr)
+	}
 	return result, nil
 }
 

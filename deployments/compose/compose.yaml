@@ -25,6 +25,7 @@ services:
     restart: unless-stopped
     environment:
       LISTEN_ADDR: :8080
+      LOG_LEVEL: ${LOG_LEVEL:-info}
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
       AGENT_BOOTSTRAP_TOKEN: ${AGENT_BOOTSTRAP_TOKEN:?请生成至少32字符随机引导令牌}
       BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME}

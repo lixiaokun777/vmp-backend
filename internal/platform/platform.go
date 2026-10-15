@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"regexp"
 	"strings"
@@ -19,7 +20,8 @@ import (
 )
 
 type Service struct {
-	DB *pgxpool.Pool
+	DB                *pgxpool.Pool
+	ObserveBackground func(context.Context, string, error)
 }
 
 type CreateApplicationInput struct {
@@ -262,7 +264,9 @@ func (s *Service) createApplicationTx(ctx context.Context, tx pgx.Tx, actor stri
 		return nil, err
 	}
 	auditDetail, _ := json.Marshal(map[string]any{"instance_id": instanceID, "host_id": hostID, "image_id": in.ImageID, "network_id": in.NetworkID, "ip_address": ipAddress})
-	_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES ($1,'application.create','application',$2,$3)`, actor, appID, auditDetail)
+	if _, auditErr := tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES ($1,'application.create','application',$2,$3)`, actor, appID, auditDetail); auditErr != nil {
+		slog.Warn("审计或操作记录写入失败", "error", auditErr)
+	}
 	return map[string]any{"id": appID, "request_no": requestNo, "instance_id": instanceID, "host": hostName, "status": "APPROVED", "connection": map[string]any{"ip_address": ipAddress, "username": username, "password": password, "available_after_provisioning": true}}, nil
 }
 
@@ -518,7 +522,9 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 		if _, err := tx.Exec(ctx, `INSERT INTO tasks(idempotency_key,task_type,resource_id,host_id,payload) VALUES ('reset-password:' || $1 || ':' || gen_random_uuid()::text,'RESET_INSTANCE_PASSWORD',$1::uuid,$2::uuid,$3)`, instanceID, hostID, payload); err != nil {
 			return nil, err
 		}
-		_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.reset_password','instance',$2,$3)`, actor, instanceID, []byte(`{"method":"qemu-guest-agent","secret_persisted":false}`))
+		if _, auditErr := tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.reset_password','instance',$2,$3)`, actor, instanceID, []byte(`{"method":"qemu-guest-agent","secret_persisted":false}`)); auditErr != nil {
+			slog.Warn("审计或操作记录写入失败", "error", auditErr)
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
 		}
@@ -543,7 +549,9 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 			}
 			return response, tx.Commit(ctx)
 		}
-		_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.retry','instance',$2,'{}'::jsonb)`, actor, instanceID)
+		if _, auditErr := tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.retry','instance',$2,'{}'::jsonb)`, actor, instanceID); auditErr != nil {
+			slog.Warn("审计或操作记录写入失败", "error", auditErr)
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
 		}
@@ -600,7 +608,9 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 		if _, err := tx.Exec(ctx, `UPDATE instances SET lifecycle_status='DELETING',retention_until=now(),updated_at=now() WHERE id=$1::uuid`, instanceID); err != nil {
 			return nil, err
 		}
-		_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.force_delete','instance',$2,'{"retention_days":0}'::jsonb)`, actor, instanceID)
+		if _, auditErr := tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.force_delete','instance',$2,'{"retention_days":0}'::jsonb)`, actor, instanceID); auditErr != nil {
+			slog.Warn("审计或操作记录写入失败", "error", auditErr)
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
 		}
@@ -623,7 +633,9 @@ func (s *Service) PerformInstanceAction(ctx context.Context, actor string, admin
 		return nil, err
 	}
 	detail, _ := json.Marshal(map[string]any{"task_type": spec.TaskType})
-	_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,$2,'instance',$3,$4)`, actor, "instance."+action, instanceID, detail)
+	if _, auditErr := tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,$2,'instance',$3,$4)`, actor, "instance."+action, instanceID, detail); auditErr != nil {
+		slog.Warn("审计或操作记录写入失败", "error", auditErr)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -675,7 +687,9 @@ func (s *Service) renewInstanceTx(ctx context.Context, tx pgx.Tx, actor string, 
 		return nil, err
 	}
 	detail, _ := json.Marshal(map[string]any{"hours": hours, "reason": reason, "expires_at": expiresAt})
-	_, _ = tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.renew','instance',$2,$3)`, actor, instanceID, detail)
+	if _, auditErr := tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'instance.renew','instance',$2,$3)`, actor, instanceID, detail); auditErr != nil {
+		slog.Warn("审计或操作记录写入失败", "error", auditErr)
+	}
 	return map[string]any{"id": instanceID, "status": lifecycleStatus, "expires_at": expiresAt}, nil
 }
 
@@ -1046,8 +1060,9 @@ func (s *Service) ReconcileInstanceLifecycle(ctx context.Context) error {
 	return tx.Commit(ctx)
 }
 
-func (s *Service) MarkOfflineHosts(ctx context.Context) {
-	_, _ = s.DB.Exec(ctx, `UPDATE hosts SET status='OFFLINE',updated_at=now() WHERE status IN ('ACTIVE','DEGRADED') AND last_heartbeat_at < now()-interval '45 seconds'`)
+func (s *Service) MarkOfflineHosts(ctx context.Context) error {
+	_, err := s.DB.Exec(ctx, `UPDATE hosts SET status='OFFLINE',updated_at=now() WHERE status IN ('ACTIVE','DEGRADED') AND last_heartbeat_at < now()-interval '45 seconds'`)
+	return err
 }
 
 func StartReconciler(ctx context.Context, service *Service) {
@@ -1058,15 +1073,20 @@ func StartReconciler(ctx context.Context, service *Service) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			service.MarkOfflineHosts(ctx)
-			if err := service.RecoverTaskLeases(ctx); err != nil {
-				fmt.Printf("recover task leases: %v\n", err)
-			}
-			if err := service.ExpirePendingApprovals(ctx); err != nil {
-				fmt.Printf("expire pending approvals: %v\n", err)
-			}
-			if err := service.ReconcileInstanceLifecycle(ctx); err != nil {
-				fmt.Printf("reconcile instance lifecycle: %v\n", err)
+			runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			hostErr := service.MarkOfflineHosts(runCtx)
+			leaseErr := service.RecoverTaskLeases(runCtx)
+			approvalErr := service.ExpirePendingApprovals(runCtx)
+			lifecycleErr := service.ReconcileInstanceLifecycle(runCtx)
+			cancel()
+			for name, err := range map[string]error{"task-lease-recovery": leaseErr, "reconciler": errors.Join(hostErr, approvalErr, lifecycleErr)} {
+				if service.ObserveBackground != nil {
+					alertCtx, alertCancel := context.WithTimeout(ctx, 5*time.Second)
+					service.ObserveBackground(alertCtx, name, err)
+					alertCancel()
+				} else if err != nil {
+					slog.Error("后台循环执行失败", "loop", name, "error", err)
+				}
 			}
 		}
 	}

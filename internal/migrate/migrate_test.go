@@ -10,8 +10,8 @@ func TestLoadFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载迁移文件失败：%v", err)
 	}
-	if len(files) != 22 {
-		t.Fatalf("迁移文件数量错误：得到 %d，期望 22", len(files))
+	if len(files) != 23 {
+		t.Fatalf("迁移文件数量错误：得到 %d，期望 23", len(files))
 	}
 
 	namePattern := regexp.MustCompile(`^\d{3}_[a-z0-9_]+\.sql$`)

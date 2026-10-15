@@ -206,6 +206,15 @@ func TestNotificationDatabaseDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 此用例使用租期通知的最小 schema；同步 020 的新配置列，不伪造其他业务表。
+	sql20, err := migrations.Files.ReadFile("020_platform_governance.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queueDDL := string(sql20)
+	queueDDL = queueDDL[strings.Index(queueDDL, "CREATE TABLE platform_notification_outbox"):strings.Index(queueDDL, "CREATE TABLE host_notification_state")]
+	if _, err = pool.Exec(ctx, queueDDL); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = pool.Exec(ctx, `ALTER TABLE notification_settings ADD COLUMN notify_approvals boolean NOT NULL DEFAULT true, ADD COLUMN notify_failures boolean NOT NULL DEFAULT true, ADD COLUMN notify_host_alerts boolean NOT NULL DEFAULT true`); err != nil {
 		t.Fatal(err)
 	}

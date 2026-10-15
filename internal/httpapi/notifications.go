@@ -26,24 +26,27 @@ import (
 
 const notificationLock = 8673221
 
+var errNotificationBusy = errors.New("通知任务正在执行，请稍后重试")
+
 type notificationSettings struct {
-	Enabled            bool       `json:"enabled"`
-	PlatformURL        string     `json:"platform_url"`
-	ReminderHours      []int      `json:"reminder_hours"`
-	NotifyRetained     bool       `json:"notify_retained"`
-	NotifyRetentionEnd bool       `json:"notify_retention_end"`
-	MentionOwner       bool       `json:"mention_owner"`
-	NotifyApprovals    bool       `json:"notify_approvals"`
-	NotifyFailures     bool       `json:"notify_failures"`
-	NotifyHostAlerts   bool       `json:"notify_host_alerts"`
-	EnabledSince       *time.Time `json:"enabled_since"`
-	LastAttempt        *time.Time `json:"last_attempt_at"`
-	LastSuccess        *time.Time `json:"last_success_at"`
-	LastError          string     `json:"last_error"`
-	WebhookURL         string     `json:"-"`
-	SignatureSecret    string     `json:"-"`
-	WebhookCipher      []byte     `json:"-"`
-	SignatureCipher    []byte     `json:"-"`
+	Enabled              bool       `json:"enabled"`
+	PlatformURL          string     `json:"platform_url"`
+	ReminderHours        []int      `json:"reminder_hours"`
+	NotifyRetained       bool       `json:"notify_retained"`
+	NotifyRetentionEnd   bool       `json:"notify_retention_end"`
+	MentionOwner         bool       `json:"mention_owner"`
+	NotifyApprovals      bool       `json:"notify_approvals"`
+	NotifyFailures       bool       `json:"notify_failures"`
+	NotifyHostAlerts     bool       `json:"notify_host_alerts"`
+	NotifyPlatformHealth bool       `json:"notify_platform_health"`
+	EnabledSince         *time.Time `json:"enabled_since"`
+	LastAttempt          *time.Time `json:"last_attempt_at"`
+	LastSuccess          *time.Time `json:"last_success_at"`
+	LastError            string     `json:"last_error"`
+	WebhookURL           string     `json:"-"`
+	SignatureSecret      string     `json:"-"`
+	WebhookCipher        []byte     `json:"-"`
+	SignatureCipher      []byte     `json:"-"`
 }
 
 type notificationQuerier interface {
@@ -55,6 +58,9 @@ func (a *API) loadNotificationSettings(ctx context.Context, db notificationQueri
 	err := db.QueryRow(ctx, `SELECT enabled,webhook_ciphertext,signature_ciphertext,platform_url,reminder_hours,notify_retained,notify_retention_end,mention_owner,enabled_since,last_attempt_at,last_success_at,last_error,notify_approvals,notify_failures,notify_host_alerts FROM notification_settings WHERE singleton=true`).Scan(
 		&c.Enabled, &c.WebhookCipher, &c.SignatureCipher, &c.PlatformURL, &c.ReminderHours, &c.NotifyRetained, &c.NotifyRetentionEnd, &c.MentionOwner, &c.EnabledSince, &c.LastAttempt, &c.LastSuccess, &c.LastError, &c.NotifyApprovals, &c.NotifyFailures, &c.NotifyHostAlerts)
 	if err != nil {
+		return c, err
+	}
+	if err = db.QueryRow(ctx, `SELECT coalesce((SELECT detail<>'disabled' FROM platform_notification_outbox WHERE event_key=$1),true)`, healthSettingsKey).Scan(&c.NotifyPlatformHealth); err != nil {
 		return c, err
 	}
 	for _, item := range []struct {
@@ -81,14 +87,15 @@ func notificationConfigResponse(c notificationSettings) map[string]any {
 	return map[string]any{"enabled": c.Enabled, "platform_url": c.PlatformURL, "reminder_hours": c.ReminderHours,
 		"notify_retained": c.NotifyRetained, "notify_retention_end": c.NotifyRetentionEnd, "mention_owner": c.MentionOwner,
 		"notify_approvals": c.NotifyApprovals, "notify_failures": c.NotifyFailures, "notify_host_alerts": c.NotifyHostAlerts,
-		"has_webhook": c.WebhookURL != "", "has_signature_secret": c.SignatureSecret != "", "webhook_display": endpoint,
+		"notify_platform_health": c.NotifyPlatformHealth,
+		"has_webhook":            c.WebhookURL != "", "has_signature_secret": c.SignatureSecret != "", "webhook_display": endpoint,
 		"last_attempt_at": c.LastAttempt, "last_success_at": c.LastSuccess, "last_error": c.LastError}
 }
 
 func (a *API) notificationConfig(w http.ResponseWriter, r *http.Request) {
 	c, err := a.loadNotificationSettings(r.Context(), a.Service.DB)
 	if err != nil {
-		writeError(w, 500, "读取通知配置失败")
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, notificationConfigResponse(c))
@@ -128,19 +135,20 @@ func validateNotificationSettings(c notificationSettings) error {
 
 func (a *API) updateNotificationConfig(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Enabled            bool   `json:"enabled"`
-		WebhookURL         string `json:"webhook_url"`
-		SignatureSecret    string `json:"signature_secret"`
-		ClearWebhook       bool   `json:"clear_webhook"`
-		ClearSignature     bool   `json:"clear_signature_secret"`
-		PlatformURL        string `json:"platform_url"`
-		ReminderHours      []int  `json:"reminder_hours"`
-		NotifyRetained     bool   `json:"notify_retained"`
-		NotifyRetentionEnd bool   `json:"notify_retention_end"`
-		MentionOwner       bool   `json:"mention_owner"`
-		NotifyApprovals    *bool  `json:"notify_approvals"`
-		NotifyFailures     *bool  `json:"notify_failures"`
-		NotifyHostAlerts   *bool  `json:"notify_host_alerts"`
+		Enabled              bool   `json:"enabled"`
+		WebhookURL           string `json:"webhook_url"`
+		SignatureSecret      string `json:"signature_secret"`
+		ClearWebhook         bool   `json:"clear_webhook"`
+		ClearSignature       bool   `json:"clear_signature_secret"`
+		PlatformURL          string `json:"platform_url"`
+		ReminderHours        []int  `json:"reminder_hours"`
+		NotifyRetained       bool   `json:"notify_retained"`
+		NotifyRetentionEnd   bool   `json:"notify_retention_end"`
+		MentionOwner         bool   `json:"mention_owner"`
+		NotifyApprovals      *bool  `json:"notify_approvals"`
+		NotifyFailures       *bool  `json:"notify_failures"`
+		NotifyHostAlerts     *bool  `json:"notify_host_alerts"`
+		NotifyPlatformHealth *bool  `json:"notify_platform_health"`
 	}
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&input) != nil {
 		writeError(w, 400, "通知配置格式无效")
@@ -148,17 +156,17 @@ func (a *API) updateNotificationConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	tx, err := a.Service.DB.Begin(r.Context())
 	if err != nil {
-		writeError(w, 500, "无法保存通知配置")
+		internalError(w, r, err)
 		return
 	}
 	defer tx.Rollback(r.Context())
 	if _, err := tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock($1)`, notificationLock); err != nil {
-		writeError(w, 500, "无法锁定通知配置")
+		internalError(w, r, err)
 		return
 	}
 	c, err := a.loadNotificationSettings(r.Context(), tx)
 	if err != nil {
-		writeError(w, 500, "读取通知配置失败")
+		internalError(w, r, err)
 		return
 	}
 	wasEnabled := c.Enabled
@@ -172,6 +180,9 @@ func (a *API) updateNotificationConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.NotifyHostAlerts != nil {
 		c.NotifyHostAlerts = *input.NotifyHostAlerts
+	}
+	if input.NotifyPlatformHealth != nil {
+		c.NotifyPlatformHealth = *input.NotifyPlatformHealth
 	}
 	if input.ClearWebhook {
 		c.WebhookURL, c.WebhookCipher = "", nil
@@ -209,10 +220,13 @@ func (a *API) updateNotificationConfig(w http.ResponseWriter, r *http.Request) {
 	_, err = tx.Exec(r.Context(), `UPDATE notification_settings SET enabled=$1,webhook_ciphertext=$2,signature_ciphertext=$3,platform_url=$4,reminder_hours=$5,notify_retained=$6,notify_retention_end=$7,mention_owner=$8,enabled_since=$9,updated_by=$10,notify_approvals=$11,notify_failures=$12,notify_host_alerts=$13,updated_at=now() WHERE singleton=true`,
 		c.Enabled, c.WebhookCipher, c.SignatureCipher, c.PlatformURL, c.ReminderHours, c.NotifyRetained, c.NotifyRetentionEnd, c.MentionOwner, c.EnabledSince, user.Username, c.NotifyApprovals, c.NotifyFailures, c.NotifyHostAlerts)
 	if err == nil {
+		err = saveHealthNotificationSetting(r.Context(), tx, c.NotifyPlatformHealth)
+	}
+	if err == nil {
 		err = tx.Commit(r.Context())
 	}
 	if err != nil {
-		writeError(w, 500, "保存通知配置失败")
+		internalError(w, r, err)
 		return
 	}
 	writeJSON(w, 200, notificationConfigResponse(c))
@@ -413,9 +427,13 @@ func (a *API) beginNotification(ctx context.Context) (pgx.Tx, error) {
 		return nil, err
 	}
 	var locked bool
-	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`, notificationLock).Scan(&locked); err != nil || !locked {
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`, notificationLock).Scan(&locked); err != nil {
 		tx.Rollback(ctx)
-		return nil, errors.New("通知任务正在执行，请稍后重试")
+		return nil, err
+	}
+	if !locked {
+		tx.Rollback(ctx)
+		return nil, errNotificationBusy
 	}
 	return tx, nil
 }
@@ -423,7 +441,11 @@ func (a *API) beginNotification(ctx context.Context) (pgx.Tx, error) {
 func (a *API) testNotification(w http.ResponseWriter, r *http.Request) {
 	tx, err := a.beginNotification(r.Context())
 	if err != nil {
-		writeError(w, 409, "通知任务正在执行，请稍后重试")
+		if errors.Is(err, errNotificationBusy) {
+			writeError(w, 409, errNotificationBusy.Error())
+		} else {
+			internalError(w, r, err)
+		}
 		return
 	}
 	defer tx.Rollback(r.Context())
@@ -452,7 +474,7 @@ func (a *API) testNotification(w http.ResponseWriter, r *http.Request) {
 		dbErr = tx.Commit(r.Context())
 	}
 	if dbErr != nil {
-		writeError(w, 500, "测试已执行但发送记录保存失败，请检查数据库后再测试")
+		internalError(w, r, dbErr)
 		return
 	}
 	if err != nil {
@@ -479,13 +501,13 @@ func (a *API) notificationEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	var total int
 	if err := a.Service.DB.QueryRow(r.Context(), `SELECT count(*) FROM notification_events WHERE ($1='' OR status=$1)`, filter).Scan(&total); err != nil {
-		writeError(w, 500, "读取通知记录失败")
+		internalError(w, r, err)
 		return
 	}
 	page = min(page, max(1, (total+19)/20))
 	rows, err := a.Service.DB.Query(r.Context(), `SELECT jsonb_build_object('id',id,'kind',kind,'instance_name',instance_name,'owner',owner_username,'status',status,'attempts',attempts,'target_at',target_at,'last_error',last_error,'message',message,'created_at',created_at,'sent_at',sent_at,'next_attempt_at',next_attempt_at) FROM notification_events WHERE ($1='' OR status=$1) ORDER BY created_at DESC,id DESC LIMIT 20 OFFSET $2`, filter, (page-1)*20)
 	if err != nil {
-		writeError(w, 500, "读取通知记录失败")
+		internalError(w, r, err)
 		return
 	}
 	defer rows.Close()
@@ -493,13 +515,13 @@ func (a *API) notificationEvents(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var data []byte
 		if err := rows.Scan(&data); err != nil {
-			writeError(w, 500, "读取通知记录失败")
+			internalError(w, r, err)
 			return
 		}
 		items = append(items, json.RawMessage(data))
 	}
 	if rows.Err() != nil {
-		writeError(w, 500, "读取通知记录失败")
+		internalError(w, r, rows.Err())
 		return
 	}
 	writeJSON(w, 200, map[string]any{"items": items, "total": total, "page": page, "page_size": 20})
@@ -511,13 +533,16 @@ func (a *API) StartNotificationLoop(ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		if err := a.dispatchPlatformNotifications(runCtx); err != nil {
-			slog.Error("平台事件群通知执行失败", "error", err)
-		}
-		if err := a.dispatchNotifications(runCtx); err != nil {
+		platformErr := a.dispatchPlatformNotifications(runCtx)
+		leaseErr := a.dispatchNotifications(runCtx)
+		cancel()
+		if a.Background != nil {
+			alertCtx, alertCancel := context.WithTimeout(ctx, 5*time.Second)
+			a.Background.Observe(alertCtx, "notifications", errors.Join(platformErr, leaseErr))
+			alertCancel()
+		} else if err := errors.Join(platformErr, leaseErr); err != nil {
 			slog.Error("群通知任务执行失败", "error", err)
 		}
-		cancel()
 		select {
 		case <-ctx.Done():
 			return
@@ -533,7 +558,7 @@ func candidateKey(id, kind string, target time.Time) string {
 func (a *API) dispatchNotifications(ctx context.Context) error {
 	tx, err := a.beginNotification(ctx)
 	if err != nil {
-		return nil
+		return notificationBeginError(err)
 	}
 	defer tx.Rollback(ctx)
 	c, err := a.loadNotificationSettings(ctx, tx)
