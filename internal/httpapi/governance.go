@@ -20,6 +20,8 @@ func (a *API) registerGovernanceRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/console/{mode}", a.consoleProxy)
 	mux.HandleFunc("GET /api/v1/platform-policy", a.platformPolicy)
 	mux.HandleFunc("PUT /api/v1/platform-policy", a.updatePlatformPolicy)
+	mux.HandleFunc("GET /api/v1/scheduler", a.schedulerStatus)
+	mux.HandleFunc("POST /api/v1/scheduler/preview", a.schedulerPreview)
 	mux.HandleFunc("GET /api/v1/instances/{id}/auto-renew", a.autoRenew)
 	mux.HandleFunc("PUT /api/v1/instances/{id}/auto-renew", a.updateAutoRenew)
 	mux.HandleFunc("GET /api/v1/approval-delegation", a.approvalDelegation)
@@ -30,6 +32,33 @@ func (a *API) registerGovernanceRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/history/archives/{id}/download", a.downloadHistoryArchive)
 	mux.HandleFunc("POST /api/v1/history/archives/{id}/purge", a.purgeHistoryArchive)
 	mux.HandleFunc("DELETE /api/v1/history/archives/{id}", a.deleteHistoryArchive)
+}
+
+func (a *API) schedulerStatus(w http.ResponseWriter, r *http.Request) {
+	position, err := a.Service.SchedulingStatus(r.Context())
+	if err != nil {
+		internalError(w, r, err)
+		return
+	}
+	writeJSON(w, 200, position)
+}
+
+func (a *API) schedulerPreview(w http.ResponseWriter, r *http.Request) {
+	var input platform.SchedulingRequest
+	if json.NewDecoder(r.Body).Decode(&input) != nil {
+		writeError(w, 400, "调度预览参数格式无效")
+		return
+	}
+	result, err := a.Service.PreviewScheduling(r.Context(), input)
+	if err != nil {
+		if errors.Is(err, platform.ErrSchedulingInput) {
+			writeError(w, 422, err.Error())
+		} else {
+			internalError(w, r, err)
+		}
+		return
+	}
+	writeJSON(w, 200, result)
 }
 
 func (a *API) platformPolicy(w http.ResponseWriter, r *http.Request) {
@@ -47,8 +76,14 @@ func (a *API) updatePlatformPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, _ := userFromRequest(r)
-	if err := a.Service.SavePolicy(r.Context(), u.Username, p); err != nil {
+	if err := p.Validate(); err != nil {
 		writeError(w, 422, err.Error())
+		return
+	}
+	var err error
+	p, err = a.Service.SavePolicySnapshot(r.Context(), u.Username, p)
+	if err != nil {
+		internalError(w, r, err)
 		return
 	}
 	a.recordAudit(r.Context(), r, u.Username, "policy.update", "configuration", "platform-policy", "SUCCESS", p)

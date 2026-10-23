@@ -134,7 +134,9 @@ func New(ctx context.Context, databaseURL string) (*Service, error) {
 }
 
 func (s *Service) createApplicationNow(ctx context.Context, actor string, in CreateApplicationInput) (map[string]any, error) {
-	tx, err := s.DB.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	// 用户额度锁、策略共享锁、调度状态锁和宿主行锁保护检查与预占。
+	// 使用读已提交使等待调度锁后的查询看到前一个申请的已提交资源和轮询位置。
+	tx, err := s.DB.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return nil, err
 	}
@@ -171,27 +173,20 @@ func (s *Service) createApplicationTx(ctx context.Context, tx pgx.Tx, actor stri
 		}
 	}
 
-	var hostID, hostName string
-	err := tx.QueryRow(ctx, `
-		SELECT h.id::text,h.name FROM hosts h
-		JOIN host_images hi ON hi.host_id=h.id AND hi.image_id=$4 AND hi.generation=$5 AND hi.status='READY' AND hi.reported_at>now()-interval '120 seconds'
-		JOIN host_networks hn ON hn.host_id=h.id AND hn.network_id=$6::uuid AND hn.ready AND hn.reported_at>now()-interval '120 seconds'
-		JOIN networks n ON n.id=hn.network_id AND n.enabled AND n.bridge=hn.bridge
-		WHERE h.status='ACTIVE' AND h.agent_mode='kvm' AND h.budget_source='CONFIGURED_TOTAL'
-		  AND h.resource_measured_at BETWEEN now()-interval '120 seconds' AND now()+interval '30 seconds'
-		  AND h.allocatable_cpu-h.reserved_cpu >= $1
-		  AND h.allocatable_memory_mb-h.reserved_memory_mb >= $2
-		  AND h.allocatable_disk_gb-h.reserved_disk_gb >= $3
-		  AND h.safe_available_memory_mb-coalesce((SELECT sum(p.allocated_memory_mb) FROM instances p WHERE p.host_id=h.id AND p.lifecycle_status<>'RELEASED' AND (p.created_at>h.resource_measured_at OR p.lifecycle_status IN ('PROVISIONING','STARTING') AND NOT(p.last_domain_seen_at>=h.resource_measured_at AND p.observed_domain_status='RUNNING'))),0)>=$2
-		  AND h.safe_available_disk_gb-coalesce((SELECT sum(p.allocated_disk_gb) FROM instances p WHERE p.host_id=h.id AND p.lifecycle_status<>'RELEASED' AND (p.created_at>h.resource_measured_at OR p.lifecycle_status='PROVISIONING' AND NOT(coalesce(p.last_domain_seen_at>=h.resource_measured_at,false)))),0)>=$3
-		ORDER BY (h.allocatable_memory_mb-h.reserved_memory_mb) DESC,h.name
-		FOR UPDATE OF h SKIP LOCKED LIMIT 1`, cpu, memoryMB, diskGB, in.ImageID, imageGeneration, in.NetworkID).Scan(&hostID, &hostName)
+	// 密码散列在取得全局调度锁前计算，避免慢散列串行阻塞所有申请。
+	password, err := generatePassword(20)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, errors.New("没有同时满足资源预算、实时安全余量、镜像和网络就绪条件的可调度宿主机")
-		}
 		return nil, err
 	}
+	var passwordHash string
+	if err := tx.QueryRow(ctx, `SELECT crypt($1, gen_salt('bf', 12))`, password).Scan(&passwordHash); err != nil {
+		return nil, fmt.Errorf("generate password hash: %w", err)
+	}
+	decision, err := s.selectSchedulingHost(ctx, tx, schedulingResources{CPU: cpu, MemoryMB: memoryMB, DiskGB: diskGB}, in.ImageID, imageGeneration, in.NetworkID)
+	if err != nil {
+		return nil, err
+	}
+	hostID, hostName := decision.HostID, decision.HostName
 	if sourceType == "local" {
 		if err := tx.QueryRow(ctx, `SELECT checksum FROM host_images WHERE host_id=$1::uuid AND image_id=$2`, hostID, in.ImageID).Scan(&imageChecksum); err != nil {
 			return nil, err
@@ -213,6 +208,13 @@ func (s *Service) createApplicationTx(ctx context.Context, tx pgx.Tx, actor stri
 		VALUES ($1::uuid,$2::uuid,$3,'PROVISIONING',now()+make_interval(hours=>$4),$5,$6,$7,$8,$9::uuid,'QUEUED',$10)
 		RETURNING id::text`, appID, hostID, in.InstanceName, in.LeaseHours, cpu, memoryMB, diskGB, flavorName, in.NetworkID, username).Scan(&instanceID)
 	if err != nil {
+		return nil, err
+	}
+	decisionJSON, err := json.Marshal(decision)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE instances SET scheduling_decision=$2 WHERE id=$1::uuid`, instanceID, decisionJSON); err != nil {
 		return nil, err
 	}
 	var ipAddress, networkName, bridge, gateway string
@@ -247,14 +249,6 @@ func (s *Service) createApplicationTx(ctx context.Context, tx pgx.Tx, actor stri
 	if err != nil {
 		return nil, err
 	}
-	password, err := generatePassword(20)
-	if err != nil {
-		return nil, err
-	}
-	var passwordHash string
-	if err := tx.QueryRow(ctx, `SELECT crypt($1, gen_salt('bf', 12))`, password).Scan(&passwordHash); err != nil {
-		return nil, fmt.Errorf("generate password hash: %w", err)
-	}
 	payload, err := json.Marshal(map[string]any{"instance_id": instanceID, "name": in.InstanceName, "cpu": cpu, "memory_mb": memoryMB, "disk_gb": diskGB, "image_id": in.ImageID, "image_checksum": imageChecksum, "image_generation": imageGeneration, "image_name": imageName, "image_file": imageFile, "image_path": imagePath, "network_id": in.NetworkID, "network_name": networkName, "bridge": bridge, "mac_address": instanceMAC(instanceID), "ip_address": ipAddress, "prefix_length": prefixLength, "gateway": gateway, "dns_servers": dnsServers, "username": username, "password_hash": passwordHash})
 	if err != nil {
 		return nil, err
@@ -263,7 +257,7 @@ func (s *Service) createApplicationTx(ctx context.Context, tx pgx.Tx, actor stri
 	if err != nil {
 		return nil, err
 	}
-	auditDetail, _ := json.Marshal(map[string]any{"instance_id": instanceID, "host_id": hostID, "image_id": in.ImageID, "network_id": in.NetworkID, "ip_address": ipAddress})
+	auditDetail, _ := json.Marshal(map[string]any{"instance_id": instanceID, "host_id": hostID, "image_id": in.ImageID, "network_id": in.NetworkID, "ip_address": ipAddress, "scheduling": decision})
 	if _, auditErr := tx.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES ($1,'application.create','application',$2,$3)`, actor, appID, auditDetail); auditErr != nil {
 		slog.Warn("审计或操作记录写入失败", "error", auditErr)
 	}

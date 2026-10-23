@@ -11,18 +11,19 @@ import (
 )
 
 type GovernancePolicy struct {
-	MaxInstances              int  `json:"max_instances"`
-	MaxCPU                    int  `json:"max_cpu"`
-	MaxMemoryMB               int  `json:"max_memory_mb"`
-	MaxDiskGB                 int  `json:"max_disk_gb"`
-	MaxFutureLeaseHours       int  `json:"max_future_lease_hours"`
-	MaxContinuousLeaseHours   int  `json:"max_continuous_lease_hours"`
-	AutoRenewEnabled          bool `json:"auto_renew_enabled"`
-	AutoRenewMaxCount         int  `json:"auto_renew_max_count"`
-	AutoRenewHours            int  `json:"auto_renew_hours"`
-	AuditRetentionDays        int  `json:"audit_retention_days"`
-	NotificationRetentionDays int  `json:"notification_retention_days"`
-	ApprovalRetentionDays     int  `json:"approval_retention_days"`
+	SchedulingStrategy        string `json:"scheduling_strategy"`
+	MaxInstances              int    `json:"max_instances"`
+	MaxCPU                    int    `json:"max_cpu"`
+	MaxMemoryMB               int    `json:"max_memory_mb"`
+	MaxDiskGB                 int    `json:"max_disk_gb"`
+	MaxFutureLeaseHours       int    `json:"max_future_lease_hours"`
+	MaxContinuousLeaseHours   int    `json:"max_continuous_lease_hours"`
+	AutoRenewEnabled          bool   `json:"auto_renew_enabled"`
+	AutoRenewMaxCount         int    `json:"auto_renew_max_count"`
+	AutoRenewHours            int    `json:"auto_renew_hours"`
+	AuditRetentionDays        int    `json:"audit_retention_days"`
+	NotificationRetentionDays int    `json:"notification_retention_days"`
+	ApprovalRetentionDays     int    `json:"approval_retention_days"`
 }
 
 type policyQuerier interface {
@@ -31,11 +32,11 @@ type policyQuerier interface {
 
 func readPolicy(ctx context.Context, db policyQuerier, lock bool) (GovernancePolicy, error) {
 	var p GovernancePolicy
-	sql := `SELECT max_instances,max_cpu,max_memory_mb,max_disk_gb,max_future_lease_hours,max_continuous_lease_hours,auto_renew_enabled,auto_renew_max_count,auto_renew_hours,audit_retention_days,notification_retention_days,approval_retention_days FROM platform_policy WHERE singleton`
+	sql := `SELECT max_instances,max_cpu,max_memory_mb,max_disk_gb,max_future_lease_hours,max_continuous_lease_hours,auto_renew_enabled,auto_renew_max_count,auto_renew_hours,audit_retention_days,notification_retention_days,approval_retention_days,scheduling_strategy FROM platform_policy WHERE singleton`
 	if lock {
 		sql += ` FOR SHARE`
 	}
-	err := db.QueryRow(ctx, sql).Scan(&p.MaxInstances, &p.MaxCPU, &p.MaxMemoryMB, &p.MaxDiskGB, &p.MaxFutureLeaseHours, &p.MaxContinuousLeaseHours, &p.AutoRenewEnabled, &p.AutoRenewMaxCount, &p.AutoRenewHours, &p.AuditRetentionDays, &p.NotificationRetentionDays, &p.ApprovalRetentionDays)
+	err := db.QueryRow(ctx, sql).Scan(&p.MaxInstances, &p.MaxCPU, &p.MaxMemoryMB, &p.MaxDiskGB, &p.MaxFutureLeaseHours, &p.MaxContinuousLeaseHours, &p.AutoRenewEnabled, &p.AutoRenewMaxCount, &p.AutoRenewHours, &p.AuditRetentionDays, &p.NotificationRetentionDays, &p.ApprovalRetentionDays, &p.SchedulingStrategy)
 	return p, err
 }
 
@@ -49,6 +50,10 @@ func (s *Service) GetPolicyTx(ctx context.Context, tx pgx.Tx) (GovernancePolicy,
 }
 
 func (p GovernancePolicy) Validate() error {
+	// 旧客户端未提交此字段时保留已保存策略，不能静默重置管理员选择。
+	if p.SchedulingStrategy != "" && !validSchedulingStrategy(p.SchedulingStrategy) {
+		return errors.New("调度策略必须为 MOST_AVAILABLE、ROUND_ROBIN 或 BALANCED")
+	}
 	for _, n := range []int{p.MaxInstances, p.MaxCPU, p.MaxMemoryMB, p.MaxDiskGB, p.MaxFutureLeaseHours, p.MaxContinuousLeaseHours} {
 		if n < 0 || n > 100000000 {
 			return errors.New("额度必须为 0 至 100000000，0 表示不限制")
@@ -72,11 +77,17 @@ func (p GovernancePolicy) Validate() error {
 }
 
 func (s *Service) SavePolicy(ctx context.Context, actor string, p GovernancePolicy) error {
-	if err := p.Validate(); err != nil {
-		return err
-	}
-	_, err := s.DB.Exec(ctx, `UPDATE platform_policy SET max_instances=$1,max_cpu=$2,max_memory_mb=$3,max_disk_gb=$4,max_future_lease_hours=$5,max_continuous_lease_hours=$6,auto_renew_enabled=$7,auto_renew_max_count=$8,auto_renew_hours=$9,audit_retention_days=$10,notification_retention_days=$11,approval_retention_days=$12,updated_by=$13,updated_at=now() WHERE singleton`, p.MaxInstances, p.MaxCPU, p.MaxMemoryMB, p.MaxDiskGB, p.MaxFutureLeaseHours, p.MaxContinuousLeaseHours, p.AutoRenewEnabled, p.AutoRenewMaxCount, p.AutoRenewHours, p.AuditRetentionDays, p.NotificationRetentionDays, p.ApprovalRetentionDays, actor)
+	_, err := s.SavePolicySnapshot(ctx, actor, p)
 	return err
+}
+
+// 返回同一 UPDATE 实际保存的策略，用于响应及审计；旧客户端空字段在数据库内原子保留。
+func (s *Service) SavePolicySnapshot(ctx context.Context, actor string, p GovernancePolicy) (GovernancePolicy, error) {
+	if err := p.Validate(); err != nil {
+		return p, err
+	}
+	err := s.DB.QueryRow(ctx, `UPDATE platform_policy SET max_instances=$1,max_cpu=$2,max_memory_mb=$3,max_disk_gb=$4,max_future_lease_hours=$5,max_continuous_lease_hours=$6,auto_renew_enabled=$7,auto_renew_max_count=$8,auto_renew_hours=$9,audit_retention_days=$10,notification_retention_days=$11,approval_retention_days=$12,updated_by=$13,updated_at=now(),scheduling_strategy=coalesce(nullif($14,''),scheduling_strategy) WHERE singleton RETURNING scheduling_strategy`, p.MaxInstances, p.MaxCPU, p.MaxMemoryMB, p.MaxDiskGB, p.MaxFutureLeaseHours, p.MaxContinuousLeaseHours, p.AutoRenewEnabled, p.AutoRenewMaxCount, p.AutoRenewHours, p.AuditRetentionDays, p.NotificationRetentionDays, p.ApprovalRetentionDays, actor, p.SchedulingStrategy).Scan(&p.SchedulingStrategy)
+	return p, err
 }
 
 // 用户级事务锁覆盖检查和预占，两个并发申请不能同时通过同一额度。

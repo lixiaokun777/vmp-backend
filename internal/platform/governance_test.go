@@ -13,6 +13,16 @@ func TestGovernancePolicyDefaultsAndBounds(t *testing.T) {
 	if err := p.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	for _, strategy := range []string{ScheduleMostAvailable, ScheduleRoundRobin, ScheduleBalanced} {
+		p.SchedulingStrategy = strategy
+		if err := p.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.SchedulingStrategy = "UNKNOWN"
+	if p.Validate() == nil {
+		t.Fatal("接受未知调度策略")
+	}
 	for _, invalid := range []GovernancePolicy{{AutoRenewHours: 169, AutoRenewMaxCount: 3}, {AutoRenewHours: 24, AutoRenewMaxCount: 101}, {AutoRenewHours: 24, AutoRenewMaxCount: 3, AuditRetentionDays: 179}, {AutoRenewHours: 24, AutoRenewMaxCount: 3, NotificationRetentionDays: 29}, {AutoRenewHours: 24, AutoRenewMaxCount: 3, ApprovalRetentionDays: 89}, {AutoRenewHours: 24, AutoRenewMaxCount: 3, MaxCPU: -1}, {AutoRenewHours: 24, AutoRenewMaxCount: 3, MaxFutureLeaseHours: 100000000}} {
 		if invalid.Validate() == nil {
 			t.Fatal("接受了无效治理策略")
