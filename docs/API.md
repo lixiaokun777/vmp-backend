@@ -1,6 +1,6 @@
 # API 说明
 
-开发分支新增 `GET /api/v1/scheduler`、`POST /api/v1/scheduler/preview`（仅管理员），以及平台策略的 `scheduling_strategy` 和实例详情的 `instance.scheduling`。预览只读、不占资源、不推进游标；支持 MOST_AVAILABLE / ROUND_ROBIN / BALANCED，具体请求和响应见 [调度策略](调度策略.md)。该能力尚未发布固定镜像。
+0.8.0 新增 `GET /api/v1/scheduler`、`POST /api/v1/scheduler/preview`（仅管理员），以及平台策略的 `scheduling_strategy` 和实例详情的 `instance.scheduling`。预览只读、不占资源、不推进游标；支持 MOST_AVAILABLE / ROUND_ROBIN / BALANCED，具体请求和响应见 [调度策略](调度策略.md)。
 
 0.7.0 验收候选：通知配置 GET/PUT 增加可选 `notify_platform_health`，缺省开启、旧客户端省略时保留原值。通知历史 `kind=PLATFORM_HEALTH` 表示后台连续失败告警。全部 5xx 使用固定中文错误响应，原始异常只记服务端日志；4xx 校验提示不变。既有任务协议只增加 HOST_DISK_INSUFFICIENT 错误码，其他字段和鉴权语义不变。
 
