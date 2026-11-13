@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const approvalThresholdHours = 7 * 24
@@ -59,10 +60,7 @@ func (s *Service) RenewInstance(ctx context.Context, actor string, administrator
 	if strings.TrimSpace(reason) == "" {
 		return nil, errors.New("请填写续期原因")
 	}
-	if hours <= approvalThresholdHours {
-		return s.renewInstanceNow(ctx, actor, administrator, instanceID, hours, reason)
-	}
-	return s.submitInstanceApproval(ctx, actor, administrator, instanceID, "RENEW", hours, reason)
+	return s.renewInstanceNow(ctx, actor, administrator, instanceID, hours, reason)
 }
 
 func (s *Service) RestoreInstance(ctx context.Context, actor string, administrator bool, instanceID string, hours int, reason string) (map[string]any, error) {
@@ -109,13 +107,22 @@ func (s *Service) submitInstanceApproval(ctx context.Context, actor string, admi
 }
 
 func (s *Service) insertApproval(ctx context.Context, actor, requestType, instanceID string, hours int, reason string, payload []byte) (map[string]any, error) {
-	reviewer, delegatedFrom, err := assignApproval(ctx, s.DB)
+	return s.insertApprovalDB(ctx, s.DB, actor, requestType, instanceID, hours, reason, payload)
+}
+
+type approvalWriter interface {
+	policyQuerier
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func (s *Service) insertApprovalDB(ctx context.Context, db approvalWriter, actor, requestType, instanceID string, hours int, reason string, payload []byte) (map[string]any, error) {
+	reviewer, delegatedFrom, err := assignApproval(ctx, db)
 	if err != nil {
 		return nil, err
 	}
 	var id, requestNo string
 	var expiresAt time.Time
-	err = s.DB.QueryRow(ctx, `INSERT INTO approval_requests(request_no,request_type,applicant,instance_id,requested_hours,reason,payload,assigned_reviewer,delegated_from) VALUES('APR-'||to_char(now(),'YYYYMMDD')||'-'||upper(substr(replace(gen_random_uuid()::text,'-',''),1,6)),$1,$2,nullif($3,'')::uuid,$4,$5,$6,nullif($7,''),nullif($8,'')) RETURNING id::text,request_no,expires_at`, requestType, actor, instanceID, hours, reason, payload, reviewer, delegatedFrom).Scan(&id, &requestNo, &expiresAt)
+	err = db.QueryRow(ctx, `INSERT INTO approval_requests(request_no,request_type,applicant,instance_id,requested_hours,reason,payload,assigned_reviewer,delegated_from) VALUES('APR-'||to_char(now(),'YYYYMMDD')||'-'||upper(substr(replace(gen_random_uuid()::text,'-',''),1,6)),$1,$2,nullif($3,'')::uuid,$4,$5,$6,nullif($7,''),nullif($8,'')) RETURNING id::text,request_no,expires_at`, requestType, actor, instanceID, hours, reason, payload, reviewer, delegatedFrom).Scan(&id, &requestNo, &expiresAt)
 	if err != nil {
 		if strings.Contains(err.Error(), "approval_requests_pending_instance_idx") {
 			return nil, errors.New("该实例已有同类型审批正在处理")
@@ -123,7 +130,7 @@ func (s *Service) insertApproval(ctx context.Context, actor, requestType, instan
 		return nil, err
 	}
 	detail, _ := json.Marshal(map[string]any{"request_no": requestNo, "request_type": requestType, "requested_hours": hours})
-	if _, auditErr := s.DB.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'approval.submit','approval',$2,$3)`, actor, id, detail); auditErr != nil {
+	if _, auditErr := db.Exec(ctx, `INSERT INTO audit_logs(actor,action,resource_type,resource_id,detail) VALUES($1,'approval.submit','approval',$2,$3)`, actor, id, detail); auditErr != nil {
 		slog.Warn("审计或操作记录写入失败", "error", auditErr)
 	}
 	return map[string]any{"id": id, "request_no": requestNo, "request_type": requestType, "requested_hours": hours, "status": "PENDING", "expires_at": expiresAt, "approval_required": true}, nil
@@ -252,7 +259,13 @@ func (s *Service) DecideApproval(ctx context.Context, reviewer, approvalID, deci
 			result, err = s.createApplicationTx(ctx, executionTx, applicant, input)
 		}
 	case "RENEW":
-		result, err = s.renewInstanceTx(ctx, executionTx, applicant, true, instanceID, requestedHours, "审批通过："+comment)
+		var snapshot struct {
+			Base     time.Time `json:"renewal_base"`
+			Previous time.Time `json:"previous_expiry"`
+		}
+		if err = json.Unmarshal(payload, &snapshot); err == nil {
+			result, err = s.renewInstanceApprovedTx(ctx, executionTx, applicant, true, instanceID, requestedHours, "审批通过："+comment, &snapshot.Base, &snapshot.Previous)
+		}
 	case "RESTORE":
 		result, err = s.restoreInstanceTx(ctx, executionTx, applicant, true, instanceID, requestedHours, "审批通过："+comment)
 	default:

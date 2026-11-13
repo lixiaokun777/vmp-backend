@@ -262,6 +262,10 @@ func (s *Service) autoRenewOne(ctx context.Context, id string) error {
 		return err
 	}
 	failure := ""
+	var pendingRenewal bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM approval_requests WHERE instance_id=$1::uuid AND request_type='RENEW' AND status='PENDING')`, id).Scan(&pendingRenewal); err != nil {
+		return err
+	}
 	if !p.AutoRenewEnabled {
 		failure = "管理员已关闭自动续期"
 	} else if !ownerActive {
@@ -270,6 +274,12 @@ func (s *Service) autoRenewOne(ctx context.Context, id string) error {
 		failure = "已达到自动续期次数上限"
 	} else if hours > p.AutoRenewHours {
 		failure = "自动续期小时超过平台上限"
+	} else if pendingRenewal {
+		failure = "续期审批待处理，已暂停自动续期，请先处理或撤回审批"
+	} else if created, nextErr := s.renewalCreatedAt(ctx, tx, id); nextErr != nil {
+		return nextErr
+	} else if renewalNeedsApproval(created, expiry.Add(time.Duration(hours)*time.Hour), hours) {
+		failure = ErrRenewalApprovalRequired.Error()
 	} else if policyErr := s.enforceLeasePolicy(ctx, tx, owner, id, expiry.Add(time.Duration(hours)*time.Hour)); policyErr != nil {
 		failure = policyErr.Error()
 	}
@@ -292,6 +302,12 @@ func (s *Service) autoRenewOne(ctx context.Context, id string) error {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (s *Service) renewalCreatedAt(ctx context.Context, tx pgx.Tx, id string) (time.Time, error) {
+	var created time.Time
+	err := tx.QueryRow(ctx, `SELECT created_at FROM instances WHERE id=$1::uuid`, id).Scan(&created)
+	return created, err
 }
 
 // 自动续期策略修改不会重置已用次数，避免反复开关绕过上限。

@@ -643,6 +643,15 @@ func (s *Service) renewInstanceNow(ctx context.Context, actor string, administra
 	}
 	defer tx.Rollback(ctx)
 	result, err := s.renewInstanceTx(ctx, tx, actor, administrator, instanceID, hours, reason)
+	if errors.Is(err, ErrRenewalApprovalRequired) {
+		var name string
+		var previous, base time.Time
+		if err = tx.QueryRow(ctx, `SELECT name,expires_at,greatest(expires_at,clock_timestamp()) FROM instances WHERE id=$1::uuid`, instanceID).Scan(&name, &previous, &base); err != nil {
+			return nil, err
+		}
+		payload, _ := json.Marshal(map[string]any{"instance_id": instanceID, "instance_name": name, "hours": hours, "reason": reason, "renewal_base": base, "previous_expiry": previous, "target_expires_at": base.Add(time.Duration(hours) * time.Hour)})
+		result, err = s.insertApprovalDB(ctx, tx, actor, "RENEW", instanceID, hours, reason, payload)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -650,12 +659,26 @@ func (s *Service) renewInstanceNow(ctx context.Context, actor string, administra
 }
 
 func (s *Service) renewInstanceTx(ctx context.Context, tx pgx.Tx, actor string, administrator bool, instanceID string, hours int, reason string) (map[string]any, error) {
+	return s.renewInstanceLeaseTx(ctx, tx, actor, administrator, instanceID, hours, reason, false, nil, nil)
+}
+
+func (s *Service) renewInstanceApprovedTx(ctx context.Context, tx pgx.Tx, actor string, administrator bool, instanceID string, hours int, reason string, base, previous *time.Time) (map[string]any, error) {
+	return s.renewInstanceLeaseTx(ctx, tx, actor, administrator, instanceID, hours, reason, true, base, previous)
+}
+
+var ErrRenewalApprovalRequired = errors.New("续期后累计租期超过首次创建起7天，请手动提交管理员审批")
+
+func renewalNeedsApproval(created, next time.Time, hours int) bool {
+	return hours > approvalThresholdHours || next.After(created.Add(approvalThresholdHours*time.Hour))
+}
+
+func (s *Service) renewInstanceLeaseTx(ctx context.Context, tx pgx.Tx, actor string, administrator bool, instanceID string, hours int, reason string, approved bool, approvedBase, previous *time.Time) (map[string]any, error) {
 	if !uuidPattern.MatchString(instanceID) || hours < 1 || hours > 720 || strings.TrimSpace(reason) == "" {
 		return nil, errors.New("实例、续期小时或续期原因无效")
 	}
 	var owner, lifecycleStatus string
-	var oldExpiry time.Time
-	err := tx.QueryRow(ctx, `SELECT a.applicant,i.lifecycle_status,i.expires_at FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &lifecycleStatus, &oldExpiry)
+	var oldExpiry, created time.Time
+	err := tx.QueryRow(ctx, `SELECT a.applicant,i.lifecycle_status,i.expires_at,i.created_at FROM instances i JOIN applications a ON a.id=i.application_id WHERE i.id=$1::uuid FOR UPDATE OF i`, instanceID).Scan(&owner, &lifecycleStatus, &oldExpiry, &created)
 	if err != nil {
 		return nil, err
 	}
@@ -668,13 +691,35 @@ func (s *Service) renewInstanceTx(ctx context.Context, tx pgx.Tx, actor string, 
 	if lifecycleStatus != "RUNNING" && lifecycleStatus != "STOPPED" {
 		return nil, fmt.Errorf("instance cannot be renewed from status %s", lifecycleStatus)
 	}
+	if !approved {
+		var pending bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM approval_requests WHERE instance_id=$1::uuid AND request_type='RENEW' AND status='PENDING')`, instanceID).Scan(&pending); err != nil {
+			return nil, err
+		}
+		if pending {
+			return nil, errors.New("该实例已有续期审批正在处理，请先处理或撤回")
+		}
+	}
 	var expiresAt time.Time
+	originalExpiry := oldExpiry
 	if oldExpiry.Before(time.Now()) {
 		oldExpiry = time.Now()
 	}
 	expiresAt = oldExpiry.Add(time.Duration(hours) * time.Hour)
+	if approved && approvedBase != nil && !approvedBase.IsZero() {
+		if previous == nil || !originalExpiry.Equal(*previous) {
+			return nil, errors.New("实例到期时间已变更，请重新提交续期审批")
+		}
+		expiresAt = approvedBase.Add(time.Duration(hours) * time.Hour)
+		if !expiresAt.After(time.Now()) {
+			return nil, errors.New("批准的目标到期时间已过，请重新申请")
+		}
+	}
 	if err := s.enforceLeasePolicy(ctx, tx, owner, instanceID, expiresAt); err != nil {
 		return nil, err
+	}
+	if !approved && renewalNeedsApproval(created, expiresAt, hours) {
+		return nil, ErrRenewalApprovalRequired
 	}
 	err = tx.QueryRow(ctx, `UPDATE instances SET expires_at=$1,updated_at=now() WHERE id=$2::uuid RETURNING expires_at`, expiresAt, instanceID).Scan(&expiresAt)
 	if err != nil {
